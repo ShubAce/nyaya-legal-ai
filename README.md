@@ -110,3 +110,4 @@ nyaya-legal-ai/
 | JSON validity | 67% | **98%** | 84% | 96% |
 | Hallucination rate | 31% | **4%** | 18% | 8% |
 | Cost per judgment | $0.00 | **$0.00** | $0.003 | $0.04 |
+"# nyaya-legal-ai" 
