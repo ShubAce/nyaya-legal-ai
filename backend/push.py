@@ -2,7 +2,7 @@
 from huggingface_hub import HfApi
 import os
 
-HF_TOKEN    = "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"
+HF_TOKEN    = os.getenv("HF_TOKEN", "")
 HF_USERNAME = "MrRoyaleAce"
 DATASET_ID  = "MrRoyaleAce/nyaya7b-finetuning-output"
 MODEL_ID    = "MrRoyaleAce/nyaya-7b"
