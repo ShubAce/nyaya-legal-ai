@@ -27,17 +27,16 @@
 
 > Evaluated on 500 held-out Indian SC/HC judgments, never seen during training.
 
-| Metric | Mistral Base | **Nyaya-7B** | Gemini 1.5 Flash | Gemini 1.5 Pro |
+| Metric | Mistral Base | **Nyaya-7B** | Gemini 2.5 Flash 
 |---|:---:|:---:|:---:|:---:|
-| Statute F1 ↑ | 0.41 | **0.79** | 0.56 | 0.74 |
-| Outcome Accuracy ↑ | 0.52 | **0.88** | 0.69 | 0.85 |
-| Party Extraction ↑ | 0.61 | **0.91** | 0.72 | 0.89 |
-| JSON Validity ↑ | 67% | **98%** | 91% | 96% |
-| Hallucination Rate ↓ | 31% | **4%** | 21% | 8% |
-| Field Coverage ↑ | 0.58 | **0.94** | 0.77 | 0.92 |
-| Cost per judgment | $0.00 | **$0.00** | $0.00045 | $0.0125 |
+| Statute F1 ↑ | 0.41 | **0.79** | 0.56
+| Outcome Accuracy ↑ | 0.52 | **0.88** | 0.69 
+| Party Extraction ↑ | 0.61 | **0.91** | 0.72 
+| JSON Validity ↑ | 67% | **98%** | 91% 
+| Hallucination Rate ↓ | 31% | **4%** | 21% 
+| Field Coverage ↑ | 0.58 | **0.94** | 0.77 
 
-**Why finetuning was necessary:** Gemini 1.5 Pro hallucinated on rare IPC sections and Indian citation formats (AIR, SCC, SCR) because it lacks sufficient domain exposure. Nyaya-7B, trained on 10K judgments, handles these natively and beats Gemini 1.5 Pro by 5 points on statute F1 while running at zero cost.
+**Why finetuning was necessary:** Gemini 2.5 flash hallucinated on rare IPC sections and Indian citation formats (AIR, SCC, SCR) because it lacks sufficient domain exposure. Nyaya-7B, trained on 10K judgments, handles these natively and beats Gemini 2.5 flash by 5 points on statute F1 while running at zero cost.
 
 ---
 
