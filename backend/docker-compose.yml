@@ -1,0 +1,85 @@
+version: "3.9"
+
+services:
+  # ── Redis — Celery task broker ──────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── FastAPI backend ──────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - FINETUNED_MODEL_PATH=/models/nyaya-7b
+      - CHROMA_STATUTE_PATH=/data/chroma_statutes
+      - CHROMA_PRECEDENT_PATH=/data/chroma_precedents
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - ./checkpoints:/models
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── Celery worker ────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: celery -A api.tasks worker --loglevel=info --concurrency=1
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - FINETUNED_MODEL_PATH=/models/nyaya-7b
+      - CHROMA_STATUTE_PATH=/data/chroma_statutes
+      - CHROMA_PRECEDENT_PATH=/data/chroma_precedents
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - ./checkpoints:/models
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── Next.js frontend ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - api
+
+volumes:
+  redis_data:

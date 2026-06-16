@@ -1,0 +1,2 @@
+statute_precision,statute_recall,statute_f1,party_accuracy,hallucination_rate,field_coverage,cost_usd,outcome_correct,json_valid,n_samples,system,error_count
+0.0714,0.125,0.0909,0.46,0.9285,1.0,0.0001,0.0,1.0,2,gemini_flash,0

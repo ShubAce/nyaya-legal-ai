@@ -1,0 +1,20 @@
+{
+  "run_id": "resume_test",
+  "timestamp": "20260612_235906",
+  "results": [
+    {
+      "statute_precision": 0.0714,
+      "statute_recall": 0.125,
+      "statute_f1": 0.0909,
+      "party_accuracy": 0.46,
+      "hallucination_rate": 0.9285,
+      "field_coverage": 1.0,
+      "cost_usd": 0.0001,
+      "outcome_correct": 0.0,
+      "json_valid": 1.0,
+      "n_samples": 2,
+      "system": "gemini_flash",
+      "error_count": 0
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "total": 1869,
+  "train": 1683,
+  "test": 186,
+  "labeller": "ollama/llama3.1:8b",
+  "sources": {
+    "IL-TUR-bail": 387,
+    "IL-TUR-summ": 364,
+    "InJudgements": 360,
+    "RishiAI": 378,
+    "IL-TUR-cjpe": 380
+  },
+  "outcomes": {
+    "dismissed": 288,
+    "allowed": 1363,
+    "disposed": 193,
+    "modified": 3,
+    "remanded": 22
+  }
+}

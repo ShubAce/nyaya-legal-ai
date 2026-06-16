@@ -1,0 +1,20 @@
+{
+  "run_id": "resume_test_interrupt",
+  "timestamp": "20260613_000031",
+  "results": [
+    {
+      "statute_precision": 0.0476,
+      "statute_recall": 0.0833,
+      "statute_f1": 0.0606,
+      "party_accuracy": 0.4467,
+      "hallucination_rate": 0.9524,
+      "field_coverage": 0.9583,
+      "cost_usd": 0.0001,
+      "outcome_correct": 0.0,
+      "json_valid": 1.0,
+      "n_samples": 3,
+      "system": "gemini_flash",
+      "error_count": 0
+    }
+  ]
+}

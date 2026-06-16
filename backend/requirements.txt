@@ -1,0 +1,64 @@
+# ── Core ML / Finetuning ──────────────────────────────────────────────────────
+torch>=2.1.0
+transformers>=4.46.0
+trl>=0.12.0
+peft>=0.11.0
+bitsandbytes>=0.43.0
+accelerate>=0.30.0
+sentencepiece>=0.2.0
+datasets>=2.19.0
+tokenizers>=0.19.0
+
+# ── Experiment tracking ───────────────────────────────────────────────────────
+wandb>=0.17.0
+
+# ── HuggingFace Hub ───────────────────────────────────────────────────────────
+huggingface-hub>=0.23.0,<1.0
+
+# ── Agent framework ───────────────────────────────────────────────────────────
+langchain>=0.2.0
+langchain-community>=0.2.0
+langgraph>=0.1.0
+
+# ── Vector DB ─────────────────────────────────────────────────────────────────
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+
+# ── API / Backend ─────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+celery>=5.4.0
+redis>=5.0.0
+python-multipart>=0.0.9
+httpx>=0.27.0
+sse-starlette>=2.1.0
+
+# ── Data / Evaluation ─────────────────────────────────────────────────────────
+pandas>=2.2.0
+numpy>=1.26.0
+scikit-learn>=1.5.0
+matplotlib>=3.9.0
+plotly>=5.22.0
+seaborn>=0.13.0
+ragas>=0.1.0
+
+# ── PDF / Text extraction ─────────────────────────────────────────────────────
+pypdf>=4.2.0
+pdfplumber>=0.11.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+loguru>=0.7.0
+typer>=0.12.0
+rich>=13.7.0
+fuzzywuzzy>=0.18.0
+python-Levenshtein>=0.25.0
+Levenshtein>=0.25.0
+
+# ── Demo ──────────────────────────────────────────────────────────────────────
+gradio>=4.36.0
+google-genai
+
+langchain_text_splitters 
+streamlit

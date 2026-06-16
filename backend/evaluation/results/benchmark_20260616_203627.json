@@ -1,0 +1,34 @@
+{
+  "run_id": "benchmark",
+  "timestamp": "20260616_203627",
+  "results": [
+    {
+      "statute_precision": 0.1853,
+      "statute_recall": 0.3967,
+      "statute_f1": 0.2266,
+      "party_accuracy": 0.5486,
+      "hallucination_rate": 0.7747,
+      "field_coverage": 0.8925,
+      "cost_usd": 0.0001,
+      "outcome_correct": 0.2,
+      "json_valid": 0.98,
+      "n_samples": 50,
+      "system": "gemini_flash",
+      "error_count": 0
+    },
+    {
+      "statute_precision": 0.4333,
+      "statute_recall": 0.44,
+      "statute_f1": 0.4248,
+      "party_accuracy": 0.4165,
+      "hallucination_rate": 0.4267,
+      "field_coverage": 0.855,
+      "cost_usd": 0.0,
+      "outcome_correct": 0.64,
+      "json_valid": 0.86,
+      "n_samples": 50,
+      "system": "nyaya_7b",
+      "error_count": 0
+    }
+  ]
+}
