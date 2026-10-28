@@ -1,328 +1,333 @@
 """
-streamlit_app.py — Nyaya Legal AI · Streamlit Interface
+streamlit_app.py — Nyaya Legal AI · Streamlit interface.
 
-A beautiful, full-featured UI to test the Nyaya legal judgment analysis pipeline.
-Connects to the local FastAPI backend at http://localhost:8000.
+Talks to the local FastAPI backend at http://127.0.0.1:8000. Theme (colours,
+fonts, light/dark) lives in .streamlit/config.toml.
 
-Run:
-    streamlit run streamlit_app.py
+Run from the backend/ directory:
+    run.bat                           # starts the API + this UI with the project venv
+    streamlit run streamlit_app.py    # UI only (venv activated, API already running)
 """
 
+import html
 import json
+import sys
 import time
+from urllib.parse import quote
 
-import streamlit as st
-import requests
 import httpx
+import streamlit as st
 
-# ── Page config (must be first Streamlit call) ────────────────────────────────
+API_BASE = "http://127.0.0.1:8000"
+CONFIDENCE_THRESHOLD = 0.70   # matches agents/confidence_agent.py
+MIN_STREAMLIT = (1, 58)       # theming + layout APIs used below; the project venv (backend\.nyaya) has it
+
+# A plain `streamlit run` in a new terminal picks up Anaconda's older Streamlit, which
+# crashes half-way through the page. Stop early with instructions instead (before
+# set_page_config, whose arguments the old version also rejects).
+if tuple(int(p) for p in st.__version__.split(".")[:2]) < MIN_STREAMLIT:
+    st.error(
+        f"**Wrong Python environment.** Nyaya needs Streamlit {'.'.join(map(str, MIN_STREAMLIT))} or newer, "
+        f"but this is Streamlit {st.__version__} from `{sys.executable}`.\n\n"
+        "Close this and start the app from the `backend` folder with **`run.bat`**, or activate the "
+        "project environment first:"
+    )
+    st.code(".nyaya\\Scripts\\activate\nstreamlit run streamlit_app.py", language="bat")
+    st.stop()
+
 st.set_page_config(
-    page_title="Nyaya Legal AI",
-    page_icon="⚖️",
+    page_title="Nyaya · Judgment Analysis",
+    page_icon=":material/balance:",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-API_BASE = "http://localhost:8000"
+for key, default in {"result": None, "textarea_judgment": "", "stream_mode": True}.items():
+    st.session_state.setdefault(key, default)
 
-# ── Session state initialisation (MUST happen before any widget) ──────────────
-if "judgment_text" not in st.session_state:
-    st.session_state["judgment_text"] = ""
-if "source_label" not in st.session_state:
-    st.session_state["source_label"] = ""
-if "final_output" not in st.session_state:
-    st.session_state["final_output"] = None
-if "analysis_done" not in st.session_state:
-    st.session_state["analysis_done"] = False
-if "stream_mode" not in st.session_state:
-    st.session_state["stream_mode"] = True
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:wght@700&display=swap');
+# ── Design tokens ─────────────────────────────────────────────────────────────
+# Status colours follow the fixed status palette (good / warning / critical) and
+# always ship with an icon + label, never colour alone.
 
-html, body, [data-testid="stAppViewContainer"] {
-    background: #0a0e1a !important;
-    color: #e2e8f0 !important;
-    font-family: 'Inter', sans-serif !important;
-}
-[data-testid="stHeader"] { background: transparent !important; }
-[data-testid="stSidebar"] {
-    background: #0f1525 !important;
-    border-right: 1px solid #1e2d4a;
-}
-[data-testid="stSidebar"] .block-container { padding-top: 2rem; }
-
-.nyaya-hero {
-    background: linear-gradient(135deg, #1a2744 0%, #0f1a35 50%, #141f3d 100%);
-    border: 1px solid #2a3d6e;
-    border-radius: 16px;
-    padding: 2rem 2.5rem;
-    margin-bottom: 1.5rem;
-    position: relative;
-    overflow: hidden;
-}
-.nyaya-hero::before {
-    content: '';
-    position: absolute;
-    top: -50%; right: -10%;
-    width: 40%; height: 200%;
-    background: radial-gradient(ellipse, rgba(99,179,237,0.06) 0%, transparent 70%);
-    pointer-events: none;
-}
-.nyaya-hero h1 {
-    font-family: 'Playfair Display', serif !important;
-    font-size: 2.4rem !important;
-    font-weight: 700 !important;
-    background: linear-gradient(135deg, #63b3ed, #a78bfa, #f472b6);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    margin: 0 0 0.4rem 0 !important;
-}
-.nyaya-hero p { color: #94a3b8 !important; font-size: 0.95rem !important; margin: 0 !important; }
-.hero-badge {
-    display: inline-block;
-    background: rgba(99,179,237,0.12);
-    border: 1px solid rgba(99,179,237,0.3);
-    color: #63b3ed;
-    padding: 0.25rem 0.75rem;
-    border-radius: 20px;
-    font-size: 0.78rem;
-    font-weight: 500;
-    margin-bottom: 0.75rem;
+TOKENS = {
+    "light": {
+        "surface": "#ffffff", "sunken": "#f3f2ed", "border": "#e2e0d8",
+        "ink": "#1b1b19", "ink2": "#55544d", "muted": "#8a8880",
+        "accent": "#22407a", "accent-fill": "#22407a", "accent-soft": "#e7ecf5",
+        "good": "#0ca30c", "good-ink": "#0a6b0a", "good-soft": "#e3f3e3",
+        "warn": "#fab219", "warn-ink": "#7a5200", "warn-soft": "#fdf1d6",
+        "crit": "#d03b3b", "crit-ink": "#a32929", "crit-soft": "#f8e3e3",
+    },
+    "dark": {
+        "surface": "#1b1b1a", "sunken": "#222220", "border": "#31312e",
+        "ink": "#f2f1ec", "ink2": "#c3c2b7", "muted": "#898781",
+        "accent": "#8fb3ef", "accent-fill": "#3f73d6", "accent-soft": "#1d2a40",
+        "good": "#0ca30c", "good-ink": "#5fd35f", "good-soft": "#16291a",
+        "warn": "#fab219", "warn-ink": "#fbc85a", "warn-soft": "#2e2614",
+        "crit": "#d03b3b", "crit-ink": "#f08a8a", "crit-soft": "#331b1b",
+    },
 }
 
-.result-card {
-    background: #111827;
-    border: 1px solid #1e2d4a;
-    border-radius: 12px;
-    padding: 1.25rem 1.5rem;
-    margin-bottom: 1rem;
-    transition: border-color 0.2s;
-}
-.result-card:hover { border-color: #2a4a7f; }
-.result-card h3 {
-    color: #63b3ed !important;
-    font-size: 0.8rem !important;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    font-weight: 600 !important;
-    margin: 0 0 0.5rem 0 !important;
-}
-.result-card .value { color: #e2e8f0; font-size: 1rem; line-height: 1.6; }
 
-.conf-bar-wrap {
-    background: #1a2744;
-    border-radius: 8px;
-    padding: 1rem 1.25rem;
-    margin: 0.5rem 0;
-    border: 1px solid #1e2d4a;
-}
-.conf-label { display: flex; justify-content: space-between; margin-bottom: 0.4rem; font-size: 0.85rem; color: #94a3b8; }
-.conf-bar { height: 6px; border-radius: 3px; background: #1e2d4a; overflow: hidden; }
-.conf-fill { height: 100%; border-radius: 3px; }
-.conf-fill.high { background: linear-gradient(90deg, #48bb78, #68d391); }
-.conf-fill.med  { background: linear-gradient(90deg, #ed8936, #f6ad55); }
-.conf-fill.low  { background: linear-gradient(90deg, #f56565, #fc8181); }
-
-.tag { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 6px; font-size: 0.78rem; font-weight: 500; margin: 0.15rem; }
-.tag-verified     { background: rgba(72,187,120,0.15); color: #68d391; border: 1px solid rgba(72,187,120,0.3); }
-.tag-hallucinated { background: rgba(245,101,101,0.15); color: #fc8181; border: 1px solid rgba(245,101,101,0.3); }
-.tag-issue        { background: rgba(99,179,237,0.12); color: #90cdf4; border: 1px solid rgba(99,179,237,0.25); }
-.tag-unresolved   { background: rgba(237,137,54,0.15); color: #f6ad55; border: 1px solid rgba(237,137,54,0.3); }
-
-.status-pill { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
-.status-ok    { background: rgba(72,187,120,0.15); color: #68d391; border: 1px solid rgba(72,187,120,0.3); }
-.status-error { background: rgba(245,101,101,0.15); color: #fc8181; border: 1px solid rgba(245,101,101,0.3); }
-
-.event-row {
-    display: flex; align-items: center; gap: 0.75rem;
-    padding: 0.5rem 0.75rem; border-radius: 8px; margin-bottom: 0.35rem;
-    background: rgba(30,45,74,0.4); font-size: 0.85rem; color: #94a3b8;
-    animation: fadeIn 0.3s ease;
-}
-.event-row .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.dot-green  { background: #48bb78; box-shadow: 0 0 6px #48bb78; }
-.dot-blue   { background: #63b3ed; box-shadow: 0 0 6px #63b3ed; }
-.dot-orange { background: #ed8936; box-shadow: 0 0 6px #ed8936; }
-.dot-purple { background: #a78bfa; box-shadow: 0 0 6px #a78bfa; }
-.dot-red    { background: #f56565; box-shadow: 0 0 6px #f56565; }
-@keyframes fadeIn { from { opacity:0; transform:translateX(-8px); } to { opacity:1; transform:translateX(0); } }
-
-.stButton > button {
-    background: linear-gradient(135deg, #2563eb, #7c3aed) !important;
-    color: white !important; border: none !important; border-radius: 8px !important;
-    font-weight: 600 !important; padding: 0.5rem 1.5rem !important;
-    font-size: 0.9rem !important; transition: opacity 0.2s !important;
-}
-.stButton > button:hover { opacity: 0.85 !important; }
-.stTextArea textarea {
-    background: #111827 !important; border: 1px solid #1e2d4a !important;
-    border-radius: 8px !important; color: #e2e8f0 !important;
-    font-family: 'Inter', monospace !important; font-size: 0.88rem !important;
-}
-.stTextArea textarea:focus { border-color: #2563eb !important; box-shadow: 0 0 0 2px rgba(37,99,235,0.2) !important; }
-button[data-baseweb="tab"] { background: transparent !important; color: #64748b !important; font-weight: 500 !important; border-bottom: 2px solid transparent !important; }
-button[data-baseweb="tab"][aria-selected="true"] { color: #63b3ed !important; border-bottom-color: #63b3ed !important; }
-[data-testid="stMetricValue"] { color: #63b3ed !important; font-size: 1.8rem !important; font-weight: 700 !important; }
-[data-testid="stMetricLabel"] { color: #64748b !important; font-size: 0.8rem !important; }
-div.stAlert { border-radius: 10px !important; }
-</style>
-""", unsafe_allow_html=True)
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def check_api_health() -> dict | None:
+def _active_theme() -> str:
     try:
-        r = requests.get(f"{API_BASE}/health", timeout=4)
-        if r.status_code == 200:
-            return r.json()
+        return "dark" if st.context.theme.type == "dark" else "light"
     except Exception:
-        pass
-    return None
+        return "light"
 
 
-def confidence_class(score: float) -> str:
-    if score >= 0.75: return "high"
-    if score >= 0.5:  return "med"
-    return "low"
+def inject_css() -> None:
+    tokens = "\n".join(f"  --n-{k}: {v};" for k, v in TOKENS[_active_theme()].items())
+    st.html(f"""<style>
+:root {{
+{tokens}
+  --n-serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --n-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+}}
+[data-testid="stDecoration"] {{ display: none; }}
+[data-testid="stHeader"] {{ background: transparent; }}
+.block-container {{ max-width: 1180px; padding-top: 2.25rem; padding-bottom: 3rem; }}
+
+/* Top bar */
+.n-topbar {{ display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  padding-bottom: 1.25rem; border-bottom: 1px solid var(--n-border); flex-wrap: wrap; }}
+.n-brand {{ display: flex; align-items: center; gap: .9rem; }}
+.n-logo {{ width: 42px; height: 42px; border-radius: 10px; background: var(--n-accent-fill); color: #fff;
+  display: grid; place-items: center; flex-shrink: 0; }}
+.n-title {{ font-family: var(--n-serif); font-size: 1.6rem; font-weight: 600; line-height: 1.15;
+  color: var(--n-ink); letter-spacing: -.01em; }}
+.n-subtitle {{ color: var(--n-ink2); font-size: .92rem; margin-top: .15rem; }}
+.n-chip {{ display: inline-flex; align-items: center; gap: .45rem; padding: .35rem .75rem; border-radius: 999px;
+  border: 1px solid var(--n-border); background: var(--n-surface); color: var(--n-ink2); font-size: .8rem; font-weight: 500; }}
+
+/* Section labels */
+.n-label {{ font-size: .72rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--n-muted); margin: 0 0 .5rem; }}
+
+/* Badges: icon + label, tinted background */
+.n-badge {{ display: inline-flex; align-items: center; gap: .35rem; padding: .22rem .6rem; border-radius: 6px;
+  font-size: .78rem; font-weight: 600; white-space: nowrap; line-height: 1.4; }}
+.n-ico {{ display: inline-block; flex-shrink: 0; background-color: currentColor;
+  -webkit-mask: var(--n-mask) center / contain no-repeat; mask: var(--n-mask) center / contain no-repeat; }}
+{_icon_css()}
+.n-good {{ background: var(--n-good-soft); color: var(--n-good-ink); }}
+.n-warn {{ background: var(--n-warn-soft); color: var(--n-warn-ink); }}
+.n-crit {{ background: var(--n-crit-soft); color: var(--n-crit-ink); }}
+.n-neutral {{ background: var(--n-sunken); color: var(--n-ink2); }}
+.n-accent {{ background: var(--n-accent-soft); color: var(--n-accent); }}
+
+/* Case header */
+.n-case {{ background: var(--n-surface); border: 1px solid var(--n-border); border-radius: 12px; padding: 1.5rem 1.75rem; }}
+.n-eyebrow {{ font-size: .75rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--n-accent); }}
+.n-case-title {{ font-family: var(--n-serif); font-size: 1.75rem; font-weight: 600; line-height: 1.25;
+  color: var(--n-ink); margin: .4rem 0 .6rem; overflow-wrap: anywhere; }}
+.n-case-meta {{ display: flex; flex-wrap: wrap; gap: .35rem 1.25rem; color: var(--n-ink2); font-size: .9rem; }}
+.n-case-meta b {{ color: var(--n-ink); font-weight: 600; }}
+.n-badges {{ display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }}
+
+/* KPI row */
+.n-kpis {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .85rem; }}
+@media (max-width: 860px) {{ .n-kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+.n-kpi {{ background: var(--n-surface); border: 1px solid var(--n-border); border-radius: 12px; padding: 1rem 1.15rem; }}
+.n-kpi-label {{ font-size: .82rem; color: var(--n-ink2); font-weight: 500; }}
+.n-kpi-value {{ font-size: 2rem; font-weight: 600; color: var(--n-ink); line-height: 1.2; margin: .3rem 0 .35rem; }}
+.n-kpi-note {{ display: flex; align-items: center; gap: .35rem; font-size: .8rem; color: var(--n-ink2); }}
+
+/* Cards, definition lists, tables */
+.n-card {{ background: var(--n-surface); border: 1px solid var(--n-border); border-radius: 12px; padding: 1.25rem 1.5rem; }}
+.n-fields {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.1rem 2rem; }}
+@media (max-width: 700px) {{ .n-fields {{ grid-template-columns: 1fr; }} }}
+.n-field-label {{ font-size: .72rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--n-muted); }}
+.n-field-value {{ margin-top: .2rem; color: var(--n-ink); font-size: .95rem; overflow-wrap: anywhere; }}
+.n-empty {{ color: var(--n-muted); }}
+.n-issues {{ margin: 0; padding-left: 1.25rem; color: var(--n-ink); }}
+.n-issues li {{ margin: .35rem 0; line-height: 1.55; }}
+.n-holding {{ font-family: var(--n-serif); font-size: 1.08rem; line-height: 1.65; color: var(--n-ink);
+  border-left: 3px solid var(--n-accent); padding: .1rem 0 .1rem 1rem; margin: 0; }}
+.n-table-wrap {{ overflow-x: auto; border: 1px solid var(--n-border); border-radius: 12px; background: var(--n-surface); }}
+.n-table {{ width: 100%; border-collapse: collapse; font-size: .9rem; }}
+.n-table th {{ text-align: left; font-size: .72rem; font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--n-muted); padding: .75rem 1rem; border-bottom: 1px solid var(--n-border); background: var(--n-sunken); }}
+.n-table td {{ padding: .8rem 1rem; border-bottom: 1px solid var(--n-border); vertical-align: top; color: var(--n-ink); }}
+.n-table tr:last-child td {{ border-bottom: none; }}
+.n-table .n-num {{ font-family: var(--n-mono); font-size: .85rem; white-space: nowrap; }}
+.n-sub {{ color: var(--n-ink2); font-size: .82rem; margin-top: .15rem; }}
+.n-details summary {{ cursor: pointer; color: var(--n-accent); font-size: .8rem; font-weight: 500; margin-top: .35rem; }}
+.n-details div {{ margin-top: .45rem; padding: .6rem .75rem; background: var(--n-sunken); border-radius: 8px;
+  color: var(--n-ink2); font-size: .82rem; line-height: 1.55; white-space: pre-wrap; }}
+.n-legend {{ display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center; margin-top: .75rem;
+  color: var(--n-ink2); font-size: .8rem; }}
+
+/* Confidence meters */
+.n-meter-row {{ display: grid; grid-template-columns: 150px minmax(0, 1fr) 44px 96px; align-items: center;
+  gap: 1rem; padding: .6rem 0; border-bottom: 1px solid var(--n-border); }}
+.n-meter-row:last-child {{ border-bottom: none; }}
+@media (max-width: 640px) {{ .n-meter-row {{ grid-template-columns: 110px minmax(0, 1fr) 40px; }} .n-meter-status {{ display: none; }} }}
+.n-meter-label {{ font-size: .9rem; color: var(--n-ink); }}
+.n-meter {{ position: relative; height: 8px; border-radius: 4px; }}
+.n-meter-fill {{ height: 100%; border-radius: 4px; }}
+.n-meter-threshold {{ position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--n-muted); border-radius: 1px; }}
+.n-meter-value {{ font-size: .88rem; font-weight: 600; color: var(--n-ink); text-align: right; font-variant-numeric: tabular-nums; }}
+.n-meter-status {{ display: flex; align-items: center; gap: .35rem; font-size: .8rem; color: var(--n-ink2); }}
+
+/* Sidebar status */
+.n-status-row {{ display: flex; justify-content: space-between; align-items: center; gap: .5rem;
+  padding: .45rem 0; border-bottom: 1px solid var(--n-border); font-size: .86rem; }}
+.n-status-row:last-child {{ border-bottom: none; }}
+.n-status-row span:first-child {{ color: var(--n-ink2); }}
+.n-status-val {{ display: inline-flex; align-items: center; gap: .35rem; color: var(--n-ink); font-weight: 500; }}
+
+/* How it works */
+.n-steps {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .85rem; }}
+@media (max-width: 860px) {{ .n-steps {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+.n-step {{ border: 1px dashed var(--n-border); border-radius: 12px; padding: 1rem 1.1rem; }}
+.n-step-num {{ width: 26px; height: 26px; border-radius: 50%; background: var(--n-accent-soft); color: var(--n-accent);
+  display: grid; place-items: center; font-size: .8rem; font-weight: 600; }}
+.n-step-title {{ font-weight: 600; color: var(--n-ink); margin: .6rem 0 .25rem; font-size: .95rem; }}
+.n-step-text {{ color: var(--n-ink2); font-size: .84rem; line-height: 1.5; }}
+
+.n-footer {{ margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--n-border);
+  color: var(--n-muted); font-size: .8rem; line-height: 1.5; }}
+</style>""")
 
 
-def confidence_color(score: float) -> str:
-    if score >= 0.75: return "#48bb78"
-    if score >= 0.5:  return "#ed8936"
-    return "#f56565"
+# ── Small HTML helpers ────────────────────────────────────────────────────────
+
+def esc(value) -> str:
+    return html.escape("" if value is None else str(value))
 
 
-def node_dot_class(node: str) -> str:
-    return {"extract":"dot-blue","validate_statutes":"dot-green",
-            "resolve_precedents":"dot-orange","score_confidence":"dot-purple",
-            "assemble":"dot-green"}.get(node, "dot-blue")
+_ICON_PATHS = {
+    "check": "<circle cx='12' cy='12' r='9'/><path d='m8 12.5 2.7 2.7L16 9.8'/>",
+    "alert": "<path d='M12 3.8 2.8 19.5h18.4z'/><path d='M12 10v4.2'/><path d='M12 17h.01'/>",
+    "cross": "<circle cx='12' cy='12' r='9'/><path d='m9 9 6 6M15 9l-6 6'/>",
+    "dot":   "<circle cx='12' cy='12' r='5' fill='black'/>",
+    "info":  "<circle cx='12' cy='12' r='9'/><path d='M12 11v5'/><path d='M12 8h.01'/>",
+    "logo":  ("<path d='M12 3v18'/><path d='M7 21h10'/><path d='M4 7h16'/>"
+              "<path d='M12 5.5 4 7l-2.5 6a3.2 3.2 0 0 0 5 0z'/><path d='M12 5.5 20 7l2.5 6a3.2 3.2 0 0 1-5 0z'/>"),
+}
+_TONE_ICON  = {"good": "check", "warn": "alert", "crit": "cross", "neutral": "info", "accent": "dot"}
+_TONE_COLOR = {"good": "var(--n-good)", "warn": "var(--n-warn)", "crit": "var(--n-crit)",
+               "neutral": "var(--n-muted)", "accent": "var(--n-accent)"}
 
 
-def node_label(node: str) -> str:
-    return {"extract":"🧠 Extracting structured data (Nyaya-7B)",
-            "validate_statutes":"📚 Validating statutes against corpus",
-            "resolve_precedents":"🔍 Resolving legal citations",
-            "score_confidence":"📊 Scoring confidence per field",
-            "assemble":"✅ Assembling final output"}.get(node, f"⚙️ {node}")
+def _icon_css() -> str:
+    """Icons are CSS masks over currentColor, so they follow the theme and survive st.html's sanitiser."""
+    rules = []
+    for name, paths in _ICON_PATHS.items():
+        svg = ("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' "
+               f"stroke-width='{1.8 if name == 'logo' else 2}' stroke-linecap='round' stroke-linejoin='round'>{paths}</svg>")
+        rules.append(f'.n-ico-{name} {{ --n-mask: url("data:image/svg+xml,{quote(svg)}"); }}')
+    return "\n".join(rules)
 
 
-def render_confidence_bars(scores: dict):
-    for field, score in scores.items():
-        css_class = confidence_class(score)
-        pct = int(score * 100)
-        st.markdown(f"""
-        <div class="conf-bar-wrap">
-            <div class="conf-label">
-                <span>{field.replace('_',' ').title()}</span>
-                <span style="color:{confidence_color(score)};font-weight:600">{pct}%</span>
-            </div>
-            <div class="conf-bar">
-                <div class="conf-fill {css_class}" style="width:{pct}%"></div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+def icon(name: str, size: int = 14, color: str = "currentColor") -> str:
+    return (f'<span class="n-ico n-ico-{name}" aria-hidden="true" '
+            f'style="width:{size}px;height:{size}px;color:{color}"></span>')
 
 
-def analyze_text_streaming(judgment_text: str):
-    payload = {"judgment_text": judgment_text, "stream": True}
-    with httpx.stream("POST", f"{API_BASE}/analyze/text", json=payload,
-                      timeout=600.0, headers={"Accept": "text/event-stream"}) as resp:
-        resp.raise_for_status()
-        for line in resp.iter_lines():
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str.strip():
-                    try:
-                        yield json.loads(data_str)
-                    except json.JSONDecodeError:
-                        pass
+def badge(label: str, tone: str, title: str = "") -> str:
+    tip = f' title="{esc(title)}"' if title else ""
+    return f'<span class="n-badge n-{tone}"{tip}>{icon(_TONE_ICON[tone], 13)}{esc(label)}</span>'
 
 
-def analyze_text_blocking(judgment_text: str) -> dict:
-    payload = {"judgment_text": judgment_text, "stream": False}
-    r = requests.post(f"{API_BASE}/analyze/text", json=payload, timeout=600)
+def status_note(text: str, tone: str) -> str:
+    """Neutral-ink text with a coloured status icon (text never wears the status colour)."""
+    return f'{icon(_TONE_ICON[tone], 14, _TONE_COLOR[tone])}<span>{esc(text)}</span>'
+
+
+# ── API ───────────────────────────────────────────────────────────────────────
+
+def fetch_health() -> dict | None:
+    try:
+        r = httpx.get(f"{API_BASE}/health", timeout=3)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def _sse_events(response: httpx.Response):
+    response.raise_for_status()
+    for line in response.iter_lines():
+        if line.startswith("data: ") and line[6:].strip():
+            try:
+                yield json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+
+
+def stream_text(judgment_text: str):
+    with httpx.stream("POST", f"{API_BASE}/analyze/text", json={"judgment_text": judgment_text, "stream": True},
+                      timeout=900.0) as resp:
+        yield from _sse_events(resp)
+
+
+def stream_file(file_bytes: bytes, filename: str):
+    with httpx.stream("POST", f"{API_BASE}/analyze", timeout=900.0,
+                      files={"file": (filename, file_bytes, "application/octet-stream")}) as resp:
+        yield from _sse_events(resp)
+
+
+def analyze_blocking(judgment_text: str) -> dict:
+    r = httpx.post(f"{API_BASE}/analyze/text", json={"judgment_text": judgment_text, "stream": False}, timeout=900.0)
     r.raise_for_status()
     return r.json()
 
 
-def analyze_file_streaming(file_bytes: bytes, filename: str):
-    with httpx.stream("POST", f"{API_BASE}/analyze",
-                      files={"file": (filename, file_bytes, "application/octet-stream")},
-                      timeout=600.0) as resp:
-        resp.raise_for_status()
-        for line in resp.iter_lines():
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str.strip():
-                    try:
-                        yield json.loads(data_str)
-                    except json.JSONDecodeError:
-                        pass
+# ── Pipeline step descriptions ────────────────────────────────────────────────
+
+STEP_NAMES = {
+    "extraction":          "Extraction",
+    "statute_validation":  "Statute validation",
+    "citation_resolution": "Precedent resolution",
+    "confidence_scoring":  "Confidence scoring",
+    "assembly":            "Assembly",
+}
 
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("""
-    <div style="text-align:center;margin-bottom:1.5rem">
-        <span style="font-size:2.5rem">⚖️</span>
-        <h2 style="color:#63b3ed;margin:0.5rem 0 0 0;font-family:'Playfair Display',serif">Nyaya AI</h2>
-        <p style="color:#475569;font-size:0.8rem;margin-top:0.25rem">Indian Legal Intelligence</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    health = check_api_health()
-    if health:
-        st.markdown('<div class="status-pill status-ok">✓ API Online</div>', unsafe_allow_html=True)
-        st.caption(f"Model loaded: {'Yes' if health.get('model_loaded') else 'No (loads on first request)'}")
-        st.caption(f"Statutes in index: {health.get('statute_index_size', 0):,}")
-        st.caption(f"Precedents in index: {health.get('precedent_index_size', 0):,}")
-    else:
-        st.markdown('<div class="status-pill status-error">✗ API Offline</div>', unsafe_allow_html=True)
-        st.error("Start: `uvicorn api.main:app --port 8000` in the backend dir.", icon="🚫")
-
-    st.divider()
-    st.markdown("### ⚙️ Settings")
-    # Give the toggle a stable key
-    st.session_state["stream_mode"] = st.toggle(
-        "Live streaming mode", value=st.session_state["stream_mode"],
-        key="toggle_stream_mode",
-        help="Stream results agent-by-agent as they complete"
-    )
-
-    st.divider()
-    st.markdown("### 📖 About")
-    st.markdown("""
-    <div style="color:#64748b;font-size:0.82rem;line-height:1.7">
-    Nyaya-7B is a <b style="color:#94a3b8">finetuned Mistral-7B</b> model trained on 10,000+ Indian court judgments.
-    <br><br>
-    The pipeline runs 5 agents:<br>
-    <b style="color:#63b3ed">1.</b> Extraction (Nyaya-7B)<br>
-    <b style="color:#63b3ed">2.</b> Statute validation (RAG)<br>
-    <b style="color:#63b3ed">3.</b> Citation resolution<br>
-    <b style="color:#63b3ed">4.</b> Confidence scoring<br>
-    <b style="color:#63b3ed">5.</b> Final assembly
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.divider()
-    if st.button("🔄 Refresh API status", key="btn_refresh"):
-        st.rerun()
+def describe_step(entry: dict) -> tuple[str, str]:
+    """Return (tone, detail) for one audit-trail entry."""
+    agent, status = entry.get("agent"), entry.get("status")
+    if agent == "extraction":
+        if status == "success":
+            return "good", f"{entry.get('field_count', 0)} fields extracted by Nyaya-7B in {entry.get('latency', 0):.1f} s"
+        if status == "json_parse_failed":
+            return "crit", "The model output was not valid JSON"
+        if status == "skipped":
+            return "crit", "Judgment text is too short"
+        return "crit", entry.get("error") or "Extraction failed"
+    if agent == "statute_validation":
+        if status == "no_statutes_to_validate":
+            return "good", "No statutes to validate"
+        flagged = entry.get("hallucinated_count", 0)
+        detail = (f"{entry.get('grounded_count', 0)} of {entry.get('total_statutes', 0)} found in the judgment, "
+                  f"{entry.get('in_corpus_count', 0)} matched in the statute corpus")
+        return ("warn", f"{detail}, {flagged} flagged") if flagged else ("good", detail)
+    if agent == "citation_resolution":
+        return "good", (f"{entry.get('total_citations', 0)} citations, "
+                        f"{entry.get('resolved_count', 0)} resolved in the local index")
+    if agent == "confidence_scoring":
+        flagged = entry.get("flagged_count", 0)
+        detail = f"Overall {entry.get('overall_confidence', 0):.0%}, {flagged} field{'s' if flagged != 1 else ''} below {CONFIDENCE_THRESHOLD:.0%}"
+        return ("warn" if flagged else "good"), detail
+    if agent == "assembly":
+        return ("good", "Final output assembled") if status == "complete" else ("crit", "No output — extraction failed")
+    return "neutral", str(status or "")
 
 
-# ── Hero ──────────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="nyaya-hero">
-    <div class="hero-badge">⚖️ Powered by Local Nyaya-7B</div>
-    <h1>Nyaya Legal AI</h1>
-    <p>Analyze Indian court judgments with a finetuned LLM — extract parties, statutes, citations, holdings and more with confidence scoring and hallucination detection.</p>
-</div>
-""", unsafe_allow_html=True)
+_MD_TONE = {"good": ":green[:material/check_circle:]", "warn": ":orange[:material/error:]",
+            "crit": ":red[:material/cancel:]", "neutral": ":gray[:material/info:]"}
 
-# ── Input tabs ────────────────────────────────────────────────────────────────
+
+def step_markdown(entry: dict) -> str:
+    tone, detail = describe_step(entry)
+    detail = detail.replace("*", "\\*").replace("_", "\\_").replace("`", "'")
+    return f"{_MD_TONE[tone]} **{STEP_NAMES.get(entry.get('agent'), entry.get('agent'))}** — {detail}"
+
+
+# ── Sample judgment ───────────────────────────────────────────────────────────
+
 SAMPLE = """IN THE SUPREME COURT OF INDIA
 Criminal Appeal No. 1481 of 2018
 (Arising out of SLP (Crl.) No. 9525 of 2017)
@@ -361,358 +366,521 @@ erroneously discarded. The chain of evidence was complete and consistent with
 the guilt of the accused. Therefore, the respondents are convicted under
 Section 302 read with Section 34 of the Indian Penal Code."""
 
-tab_text, tab_pdf, tab_sample = st.tabs(["📝 Paste Judgment Text", "📄 Upload PDF / TXT", "💡 Try a Sample"])
 
-with tab_text:
-    pasted = st.text_area(
-        "Paste judgment text",
-        height=300,
-        placeholder="IN THE SUPREME COURT OF INDIA\nCriminal Appeal No. ...\n\nJUDGMENT\n...",
-        label_visibility="collapsed",
-        key="textarea_judgment",
-    )
-    if pasted and pasted.strip():
-        st.session_state["judgment_text"] = pasted
-        st.session_state["source_label"]  = "pasted text"
+def _load_sample() -> None:
+    st.session_state["textarea_judgment"] = SAMPLE
 
-with tab_pdf:
-    uploaded = st.file_uploader(
-        "Upload judgment PDF or TXT (max 10 MB)",
-        type=["pdf", "txt", "text"],
-        label_visibility="collapsed",
-        key="file_uploader_judgment",
-    )
-    if uploaded:
-        st.success(f"Loaded: **{uploaded.name}** ({uploaded.size / 1024:.1f} KB)")
-        st.session_state["source_label"] = uploaded.name
 
-with tab_sample:
-    st.markdown("""
-    <div style="color:#94a3b8;font-size:0.88rem;margin-bottom:1rem">
-    Use this pre-loaded Supreme Court judgment to test the pipeline without your own data.
-    </div>
-    """, unsafe_allow_html=True)
-    st.code(SAMPLE[:600] + "\n...[truncated for display]", language="text")
-    if st.button("📋 Use this sample", use_container_width=True, key="btn_use_sample"):
-        st.session_state["judgment_text"] = SAMPLE
-        st.session_state["source_label"]  = "sample judgment"
-        st.session_state["analysis_done"] = False
-        st.session_state["final_output"]  = None
-        st.success("Sample loaded! Click **⚡ Analyze Judgment** below.")
+def _clear_text() -> None:
+    st.session_state["textarea_judgment"] = ""
 
-st.markdown("<br>", unsafe_allow_html=True)
 
-# Resolve final judgment text (file upload overrides paste if both present)
-judgment_text = ""
-source_label  = st.session_state.get("source_label", "")
+def _new_analysis() -> None:
+    st.session_state["result"] = None
+    st.session_state["textarea_judgment"] = ""
 
-if uploaded:
-    # Will be read at analysis time
-    judgment_text = "__FILE__"
-elif st.session_state.get("judgment_text"):
-    judgment_text = st.session_state["judgment_text"]
 
-# ── Analyze button row ────────────────────────────────────────────────────────
-col_btn, col_info = st.columns([1, 3])
-with col_btn:
-    analyze_clicked = st.button("⚡ Analyze Judgment", use_container_width=True,
-                                type="primary", key="btn_analyze")
-with col_info:
-    if judgment_text:
-        text_len = len(st.session_state.get("judgment_text", "")) if judgment_text != "__FILE__" else (uploaded.size if uploaded else 0)
-        st.markdown(
-            f'<div style="padding:0.5rem 0;color:#64748b;font-size:0.85rem">'
-            f'📄 {text_len:,} chars from <b style="color:#94a3b8">{source_label}</b>'
-            f'</div>',
-            unsafe_allow_html=True,
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+def _status_row(label: str, value: str, tone: str) -> str:
+    return (f'<div class="n-status-row"><span>{esc(label)}</span>'
+            f'<span class="n-status-val">{icon(_TONE_ICON[tone], 13, _TONE_COLOR[tone])}{esc(value)}</span></div>')
+
+
+def render_system_status(polling: bool) -> None:
+    health = fetch_health()
+    if polling and health and (health.get("model_loaded") or health.get("model_error")):
+        st.rerun()   # backend finished starting — full rerun stops the polling
+    if health is None:
+        rows = _status_row("API", "Offline", "crit")
+    else:
+        if health.get("model_loaded"):
+            model = ("Ready", "good")
+        elif health.get("model_error"):
+            model = ("Failed", "crit")
+        else:
+            model = ("Loading…", "warn")
+        statutes, precedents = health.get("statute_index_size", 0), health.get("precedent_index_size", 0)
+        rows = (_status_row("API", "Online", "good")
+                + _status_row("Nyaya-7B", *model)
+                + _status_row("Statute index", f"{statutes:,} chunks" if statutes else "Loading…", "good" if statutes else "warn")
+                + _status_row("Precedent index", f"{precedents:,} cases" if precedents else "Loading…", "good" if precedents else "warn"))
+    st.html(f'<div>{rows}</div>')
+
+    if health is None:
+        st.caption("Start the backend from the `backend` folder with `run.bat`.")
+    elif health.get("model_error"):
+        st.error(health["model_error"], icon=":material/error:")
+    elif not health.get("model_loaded"):
+        st.caption("The model loads onto the GPU in about 30–40 seconds. This panel refreshes on its own.")
+    st.button("Refresh", icon=":material/refresh:", type="tertiary", key="btn_refresh")
+
+
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.html('<div class="n-label">System status</div>')
+        # Poll while the backend is still starting, but never during an analysis run.
+        health = fetch_health()
+        ready = bool(health and health.get("model_loaded"))
+        polling = not ready and not st.session_state.get("btn_analyze") and not (health or {}).get("model_error")
+        st.fragment(render_system_status, run_every="4s" if polling else None)(polling)
+
+        st.divider()
+        st.html('<div class="n-label">Settings</div>')
+        st.toggle("Stream pipeline progress", key="stream_mode",
+                  help="Show each agent as it finishes. Turn off to wait for the complete result.")
+
+        st.divider()
+        st.html('<div class="n-label">About</div>')
+        st.caption(
+            "Nyaya-7B is Mistral-7B finetuned with QLoRA on Indian Supreme Court and High Court judgments. "
+            "It runs on this machine's GPU; judgments are not sent to any external service."
         )
 
-# ── Run analysis ──────────────────────────────────────────────────────────────
-if analyze_clicked:
-    if not health:
-        st.error("❌ Cannot connect to Nyaya API at http://localhost:8000. Is uvicorn running?")
-        st.stop()
 
-    # Resolve actual text / file bytes
-    actual_text  = None
-    file_bytes   = None
-    file_name    = None
+# ── Header and input ──────────────────────────────────────────────────────────
 
-    if uploaded:
-        file_bytes = uploaded.read()
-        file_name  = uploaded.name
-    elif st.session_state.get("judgment_text"):
-        actual_text = st.session_state["judgment_text"]
-    else:
-        st.warning("⚠️ Please paste judgment text, upload a file, or use the sample.")
-        st.stop()
+def render_topbar() -> None:
+    st.html(f"""
+<div class="n-topbar">
+  <div class="n-brand">
+    <div class="n-logo">{icon("logo", 24, "#ffffff")}</div>
+    <div>
+      <div class="n-title">Nyaya</div>
+      <div class="n-subtitle">Structured analysis of Indian court judgments</div>
+    </div>
+  </div>
+  <span class="n-chip">{icon("dot", 12, "var(--n-good)")}Runs locally · Nyaya-7B</span>
+</div>""")
 
-    if actual_text and len(actual_text.strip()) < 200:
-        st.warning("⚠️ Text too short (minimum 200 characters).")
-        st.stop()
 
-    st.markdown("---")
+def render_input(collapsed: bool):
+    """Render the input card (collapsed into an expander once results are shown).
+    Returns (kind, payload, label) or None when there is no input."""
+    box = (st.expander("Judgment input", icon=":material/description:", expanded=False) if collapsed
+           else st.container(border=True))
+    with box:
+        if not collapsed:
+            st.html('<div class="n-label">Judgment</div>')
+        tab_text, tab_file = st.tabs([":material/edit_note: Paste text", ":material/upload_file: Upload file"])
 
-    progress_header = st.empty()
-    progress_header.markdown("### 🔄 Processing Pipeline")
-    event_area  = st.empty()
-    final_output = None
-    had_error    = False
-    t_start      = time.time()
+        with tab_text:
+            text = st.text_area(
+                "Judgment text", key="textarea_judgment", height=260, label_visibility="collapsed",
+                placeholder="Paste the full text of a judgment — e.g. IN THE SUPREME COURT OF INDIA …",
+            )
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.caption(f"{len(text):,} characters" if text else "Minimum 200 characters.")
+                st.space("stretch")
+                st.button("Load sample", icon=":material/description:", type="tertiary",
+                          on_click=_load_sample, key="btn_sample")
+                st.button("Clear", icon=":material/close:", type="tertiary",
+                          on_click=_clear_text, key="btn_clear_text", disabled=not text)
 
-    stream_mode = st.session_state.get("stream_mode", True)
+        with tab_file:
+            uploaded = st.file_uploader("Judgment file", type=["pdf", "txt"], label_visibility="collapsed",
+                                        key="file_uploader_judgment",
+                                        help="PDF or plain text, up to 10 MB. Scanned PDFs without a text layer are not supported.")
 
-    if stream_mode:
+    if uploaded is not None:
+        return "file", uploaded, f"{uploaded.name} ({uploaded.size / 1024:,.0f} KB)"
+    if text.strip():
+        return "text", text, f"pasted text ({len(text):,} characters)"
+    return None
+
+
+# ── Running an analysis ───────────────────────────────────────────────────────
+
+def run_analysis(source) -> None:
+    kind, payload, label = source
+    if kind == "text" and len(payload.strip()) < 200:
+        st.warning("The judgment text is too short — paste at least 200 characters.", icon=":material/warning:")
+        return
+    if fetch_health() is None:
+        st.error(f"Cannot reach the Nyaya API at {API_BASE}. Start the backend with `run.bat`.", icon=":material/cloud_off:")
+        return
+
+    audit, errors, final_output = [], [], None
+    t0 = time.time()
+    with st.status("Extracting structured data with Nyaya-7B…", expanded=True) as status:
+        st.caption(f"Source: {label}. Extraction takes about a minute on a laptop GPU.")
         try:
-            if file_bytes:
-                gen = analyze_file_streaming(file_bytes, file_name)
+            if kind == "file" or st.session_state["stream_mode"]:
+                events = stream_file(payload.getvalue(), payload.name) if kind == "file" else stream_text(payload)
+                for evt in events:
+                    if evt.get("event") == "error":
+                        errors.extend(evt.get("errors") or [evt.get("error", "Unknown error")])
+                        continue
+                    if not evt.get("node"):
+                        continue
+                    errors.extend(evt.get("errors") or [])
+                    for entry in evt.get("audit_trail") or []:
+                        audit.append(entry)
+                        st.markdown(step_markdown(entry))
+                    if evt["node"] == "extract":
+                        status.update(label="Validating statutes and resolving precedents…")
+                    if evt.get("final_output"):
+                        final_output = evt["final_output"]
             else:
-                gen = analyze_text_streaming(actual_text)
-
-            events_html = []
-            with st.spinner("🧠 Loading Nyaya-7B and running pipeline (first call ~1-2 min)..."):
-                for evt in gen:
-                    etype = evt.get("event") or evt.get("node")
-                    if etype == "start":
-                        events_html.append('<div class="event-row"><div class="dot dot-blue"></div>Pipeline started</div>')
-                    elif etype == "complete":
-                        elapsed = time.time() - t_start
-                        events_html.append(f'<div class="event-row"><div class="dot dot-green"></div>✅ Done in {elapsed:.1f}s</div>')
-                    elif etype == "error":
-                        events_html.append(f'<div class="event-row"><div class="dot dot-red"></div>❌ {evt.get("error","unknown")}</div>')
-                        had_error = True
-                    else:
-                        node = evt.get("node", etype or "")
-                        dot  = node_dot_class(node)
-                        lbl  = node_label(node)
-                        conf = evt.get("overall_confidence")
-                        conf_str = f" · {conf:.0%} confidence" if conf is not None else ""
-                        events_html.append(f'<div class="event-row"><div class="dot {dot}"></div>{lbl}{conf_str}</div>')
-                        if evt.get("final_output"):
-                            final_output = evt["final_output"]
-
-                    event_area.markdown("<div>" + "".join(events_html) + "</div>", unsafe_allow_html=True)
-
+                data = analyze_blocking(payload)
+                final_output, audit, errors = data.get("final_output"), data.get("audit_trail") or [], data.get("errors") or []
+                for entry in audit:
+                    st.markdown(step_markdown(entry))
         except httpx.HTTPStatusError as e:
-            st.error(f"API error {e.response.status_code}: {e.response.text[:400]}")
-            had_error = True
-        except Exception as e:
-            st.error(f"Connection error: {e}")
-            had_error = True
-    else:
-        with st.spinner("🧠 Running pipeline (may take 1–5 min on first run)..."):
-            try:
-                data = analyze_text_blocking(actual_text)
-                final_output = data.get("final_output")
-                for err in data.get("errors", []):
-                    st.warning(f"Pipeline warning: {err}")
-            except Exception as e:
-                st.error(f"Error: {e}")
-                had_error = True
+            errors.append(f"API error {e.response.status_code}: {e.response.text[:300]}")
+        except httpx.HTTPError as e:
+            errors.append(f"Connection to the API failed: {e}")
 
-    if had_error:
-        st.stop()
-
-    if final_output is None:
-        st.info("⏳ No output yet. The model may still be loading — please try again shortly.", icon="⏳")
-        st.stop()
-
-    st.session_state["final_output"]  = final_output
-    st.session_state["analysis_done"] = True
-
-    elapsed_total = time.time() - t_start
-    progress_header.markdown(
-        f"### ✅ Analysis Complete  <span style='font-size:0.85rem;color:#64748b;font-weight:400'>({elapsed_total:.1f}s)</span>",
-        unsafe_allow_html=True,
-    )
-
-# ── Results (persisted in session_state) ─────────────────────────────────────
-if st.session_state.get("analysis_done") and st.session_state.get("final_output"):
-    final_output = st.session_state["final_output"]
-
-    st.markdown("---")
-    st.markdown("## 📋 Extraction Results")
-
-    overall_conf = final_output.get("overall_confidence", 0)
-    n_statutes   = len(final_output.get("statutes_cited", []))
-    n_hall       = len(final_output.get("hallucinated_statutes", []))
-    n_prec       = len(final_output.get("precedents_cited", []))
-    needs_review = final_output.get("needs_human_review", False)
-
-    m1, m2, m3, m4 = st.columns(4)
-    with m1: st.metric("Overall Confidence", f"{overall_conf:.0%}")
-    with m2: st.metric("Statutes Found", n_statutes)
-    with m3: st.metric("Precedents", n_prec)
-    with m4: st.metric("Hallucinations", n_hall,
-                        delta="⚠️ Review" if n_hall > 0 else "✓ Clean",
-                        delta_color="inverse" if n_hall > 0 else "normal")
-
-    if needs_review:
-        st.warning("⚠️ **Human review recommended** — low confidence fields or hallucinated statutes detected.", icon="🔍")
-    else:
-        st.success("✅ **High confidence** — all fields passed validation.", icon="✔️")
-
-    r1, r2, r3, r4, r5 = st.tabs(["🏛️ Case Info", "📚 Statutes", "⚖️ Precedents", "📊 Confidence", "🔍 Raw JSON"])
-
-    def card(label: str, value, empty_msg="—"):
-        val = value if value else empty_msg
-        st.markdown(f"""
-        <div class="result-card">
-            <h3>{label}</h3>
-            <div class="value">{val}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with r1:
-        st.markdown("#### Core Case Information")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            card("Case Name",      final_output.get("case_name"))
-            card("Petitioner",     final_output.get("petitioner"))
-            card("Court",          final_output.get("court"))
-            card("Year",           str(final_output.get("year") or "—"))
-        with col_b:
-            card("Citation",       final_output.get("citation"))
-            card("Respondent",     final_output.get("respondent"))
-            card("Subject Matter", final_output.get("subject_matter"))
-            card("Outcome",        final_output.get("outcome"))
-        card("Holding", final_output.get("holding"))
-        issues = final_output.get("legal_issues", [])
-        if issues:
-            tags = "".join(f'<span class="tag tag-issue">{i}</span>' for i in issues)
-            st.markdown(f'<div class="result-card"><h3>Legal Issues ({len(issues)})</h3><div style="margin-top:0.25rem">{tags}</div></div>', unsafe_allow_html=True)
-        bench = final_output.get("bench", [])
-        if bench:
-            card("Bench", " · ".join(bench))
-
-    with r2:
-        st.markdown("#### Statutes Cited")
-        statutes = final_output.get("statutes_cited", [])
-        if not statutes:
-            st.info("No statutes extracted.")
-        for s in statutes:
-            verified    = s.get("verified", False)
-            tag_cls     = "tag-verified" if verified else "tag-hallucinated"
-            tag_txt     = "✓ Verified" if verified else "⚠ Flagged"
-            s_act       = s.get("act", "")
-            s_sec       = s.get("section", "")
-            desc        = s.get("description") or ""
-            actual      = s.get("actual_text") or ""
-            desc_html   = f'<div style="color:#94a3b8;font-size:0.88rem;margin-top:0.4rem">{desc}</div>' if desc else ""
-            actual_html = f'<div style="font-size:0.78rem;color:#64748b;margin-top:0.5rem;font-style:italic">{actual[:200]}</div>' if actual else ""
-            st.html(f"""<div class="result-card" style="background:#111827;border:1px solid #1e2d4a;border-radius:12px;padding:1.25rem 1.5rem;margin-bottom:1rem">
-  <div style="display:flex;justify-content:space-between;align-items:center">
-    <div><b style="color:#e2e8f0">{s_act}</b><span style="color:#63b3ed;margin-left:0.5rem">§{s_sec}</span></div>
-    <span style="display:inline-block;padding:0.2rem 0.6rem;border-radius:6px;font-size:0.78rem;font-weight:500;{'background:rgba(72,187,120,0.15);color:#68d391;border:1px solid rgba(72,187,120,0.3)' if verified else 'background:rgba(245,101,101,0.15);color:#fc8181;border:1px solid rgba(245,101,101,0.3)'}">{tag_txt}</span>
-  </div>{desc_html}{actual_html}</div>""")
-        hall = final_output.get("hallucinated_statutes", [])
-        if hall:
-            st.markdown("##### ⚠️ Hallucinated / Unverified")
-            st.html("".join(f'<span style="display:inline-block;padding:0.2rem 0.6rem;border-radius:6px;font-size:0.78rem;font-weight:500;background:rgba(245,101,101,0.15);color:#fc8181;border:1px solid rgba(245,101,101,0.3);margin:0.15rem">{h}</span>' for h in hall))
-
-    with r3:
-        st.markdown("#### Precedents Cited")
-        precedents = final_output.get("precedents_cited", [])
-        if not precedents:
-            st.info("No precedents extracted.")
-        for p in precedents:
-            resolved      = p.get("resolved", False)
-            tag_cls       = "tag-verified" if resolved else "tag-unresolved"
-            tag_txt       = ("✓ " + p.get("source", "resolved")) if resolved else "⚠ Unresolved"
-            p_citation    = p.get("citation", "")
-            p_case        = p.get("case_name", "")
-            p_court       = p.get("court", "")
-            p_year        = str(p.get("year", "")) if p.get("year") else ""
-            summary       = p.get("summary") or ""
-            # Build sub-parts as clean strings (no nesting)
-            case_html    = f'<div style="color:#94a3b8;font-size:0.85rem;margin-top:0.2rem">{p_case}</div>' if p_case else ""
-            meta_parts   = []
-            if p_court: meta_parts.append(f'<span>🏛️ {p_court}</span>')
-            if p_year:  meta_parts.append(f'<span>📅 {p_year}</span>')
-            meta_html    = f'<div style="display:flex;gap:1rem;margin-top:0.5rem;font-size:0.8rem;color:#64748b">{"".join(meta_parts)}</div>' if meta_parts else ""
-            summary_html = f'<div style="color:#64748b;font-size:0.78rem;margin-top:0.4rem;font-style:italic">{summary[:200]}</div>' if summary else ""
-            tag_style    = "background:rgba(72,187,120,0.15);color:#68d391;border:1px solid rgba(72,187,120,0.3)" if resolved else "background:rgba(237,137,54,0.15);color:#f6ad55;border:1px solid rgba(237,137,54,0.3)"
-            st.html(f"""<div style="background:#111827;border:1px solid #1e2d4a;border-radius:12px;padding:1.25rem 1.5rem;margin-bottom:1rem">
-  <div style="display:flex;justify-content:space-between;align-items:flex-start">
-    <div><b style="color:#e2e8f0">{p_citation}</b>{case_html}</div>
-    <span style="display:inline-block;padding:0.2rem 0.6rem;border-radius:6px;font-size:0.78rem;font-weight:500;flex-shrink:0;margin-left:0.75rem;{tag_style}">{tag_txt}</span>
-  </div>{meta_html}{summary_html}</div>""")
-
-    with r4:
-        st.markdown("#### Per-Field Confidence Scores")
-        conf_scores = final_output.get("confidence_scores", {})
-        if conf_scores:
-            render_confidence_bars(conf_scores)
+        elapsed = time.time() - t0
+        if final_output:
+            status.update(label=f"Analysis complete in {elapsed:.0f} s", state="complete", expanded=False)
         else:
-            st.info("No confidence scores available.")
-        uncertain = final_output.get("uncertain_fields", [])
+            status.update(label="Analysis failed", state="error", expanded=True)
+
+    st.session_state["result"] = {
+        "final_output": final_output,
+        "audit": audit,
+        "errors": list(dict.fromkeys(errors)),
+        "elapsed": elapsed,
+        "source": label,
+    }
+    st.rerun()   # redraw with the input collapsed and the results in place (steps stay in the Audit trail tab)
+
+
+# ── Results ───────────────────────────────────────────────────────────────────
+
+STATUTE_STATUS = {
+    "verified":        ("In judgment + corpus", "good", "Mentioned in the judgment; statutory text found in the local corpus"),
+    "grounded":        ("In judgment", "good", "Mentioned in the judgment; the local corpus does not cover this section"),
+    "incomplete":      ("No section given", "warn", "The model named the act but not a section, so it cannot be checked"),
+    "not_in_judgment": ("Not in judgment", "crit", "The judgment never mentions this section — possible hallucination"),
+}
+
+FIELD_LABELS = {
+    "case_name": "Case name", "court": "Court", "year": "Year", "parties": "Parties", "outcome": "Outcome",
+    "holding": "Holding", "statutes_cited": "Statutes", "precedents_cited": "Precedents",
+    "legal_issues": "Legal issues", "citation_format": "Citation format",
+}
+
+
+def _confidence_level(score: float) -> tuple[str, str]:
+    if score >= 0.85:
+        return "High", "good"
+    if score >= CONFIDENCE_THRESHOLD:
+        return "Moderate", "warn"
+    return "Review", "crit"
+
+
+def _section_ref(statute: dict) -> str:
+    prefix = "Art." if "constitution" in (statute.get("act") or "").lower() else "§"
+    return f"{prefix} {statute.get('section') or '—'}"
+
+
+def case_header_html(out: dict) -> str:
+    eyebrow = " · ".join(esc(x) for x in (out.get("subject_matter"), out.get("court")) if x) or "Judgment"
+    meta = []
+    meta.append(f"<span><b>Citation</b> {esc(out.get('citation'))}</span>" if out.get("citation")
+                else '<span class="n-empty">No reported citation</span>')
+    if out.get("year"):
+        meta.append(f"<span><b>Year</b> {esc(out['year'])}</span>")
+    if out.get("bench"):
+        meta.append(f"<span><b>Bench</b> {esc(', '.join(out['bench']))}</span>")
+
+    badges = []
+    if out.get("outcome"):
+        badges.append(f'<span class="n-badge n-accent">Outcome · {esc(out["outcome"].capitalize())}</span>')
+    uncertain, hallucinated = out.get("uncertain_fields") or [], out.get("hallucinated_statutes") or []
+    if out.get("needs_human_review"):
+        reasons = []
         if uncertain:
-            st.markdown("##### ⚠️ Fields Flagged for Review")
-            st.html("".join(f'<span style="display:inline-block;padding:0.2rem 0.6rem;border-radius:6px;font-size:0.78rem;font-weight:500;background:rgba(245,101,101,0.15);color:#fc8181;border:1px solid rgba(245,101,101,0.3);margin:0.15rem">{f.replace("_"," ").title()}</span>' for f in uncertain))
+            reasons.append(f"{len(uncertain)} low-confidence field{'s' if len(uncertain) != 1 else ''}")
+        if hallucinated:
+            reasons.append(f"{len(hallucinated)} flagged statute{'s' if len(hallucinated) != 1 else ''}")
+        badges.append(badge("Needs human review", "warn", "; ".join(reasons)))
+    else:
+        badges.append(badge("All checks passed", "good"))
+
+    return f"""
+<div class="n-case">
+  <div class="n-eyebrow">{eyebrow}</div>
+  <div class="n-case-title">{esc(out.get('case_name') or 'Untitled judgment')}</div>
+  <div class="n-case-meta">{''.join(meta)}</div>
+  <div class="n-badges">{''.join(badges)}</div>
+</div>"""
+
+
+def kpi_row_html(out: dict) -> str:
+    statutes = out.get("statutes_cited") or []
+    precedents = out.get("precedents_cited") or []
+    hallucinated = out.get("hallucinated_statutes") or []
+    uncertain = out.get("uncertain_fields") or []
+    overall = out.get("overall_confidence") or 0.0
+
+    grounded = sum(1 for s in statutes if s.get("verified"))
+    resolved = sum(1 for p in precedents if p.get("resolved"))
+
+    def tile(label, value, note_text, tone):
+        return (f'<div class="n-kpi"><div class="n-kpi-label">{esc(label)}</div>'
+                f'<div class="n-kpi-value">{esc(value)}</div>'
+                f'<div class="n-kpi-note">{status_note(note_text, tone)}</div></div>')
+
+    return '<div class="n-kpis">' + "".join([
+        tile("Overall confidence", f"{overall:.0%}",
+             f"{len(uncertain)} field{'s' if len(uncertain) != 1 else ''} to review" if uncertain else "No fields flagged",
+             "warn" if uncertain else "good"),
+        tile("Statutes cited", len(statutes),
+             f"{grounded} of {len(statutes)} found in judgment" if statutes else "None extracted",
+             "good" if grounded == len(statutes) else "warn"),
+        tile("Precedents cited", len(precedents),
+             f"{resolved} resolved in local index" if precedents else "None cited",
+             "good" if precedents and resolved == len(precedents) else "neutral"),
+        tile("Possible hallucinations", len(hallucinated),
+             "Review flagged statutes" if hallucinated else "None detected",
+             "crit" if hallucinated else "good"),
+    ]) + "</div>"
+
+
+def overview_html(out: dict) -> str:
+    def field(label, value):
+        if isinstance(value, list):
+            value = ", ".join(value)
+        shown = esc(value) if value not in (None, "", []) else '<span class="n-empty">Not found</span>'
+        return f'<div><div class="n-field-label">{esc(label)}</div><div class="n-field-value">{shown}</div></div>'
+
+    details = "".join([
+        field("Petitioner / appellant", out.get("petitioner")),
+        field("Respondent", out.get("respondent")),
+        field("Court", out.get("court")),
+        field("Year", out.get("year")),
+        field("Subject matter", out.get("subject_matter")),
+        field("Outcome", (out.get("outcome") or "").capitalize()),
+        field("Citation", out.get("citation")),
+        field("Bench", out.get("bench")),
+    ])
+    issues = out.get("legal_issues") or []
+    issues_html = ("<ol class='n-issues'>" + "".join(f"<li>{esc(i)}</li>" for i in issues) + "</ol>"
+                   if issues else '<div class="n-empty">No legal issues extracted.</div>')
+    holding = out.get("holding")
+    holding_html = (f'<blockquote class="n-holding">{esc(holding)}</blockquote>'
+                    if holding else '<div class="n-empty">No holding extracted.</div>')
+
+    return f"""
+<div class="n-card"><div class="n-label">Holding</div>{holding_html}</div>
+<div style="height:.85rem"></div>
+<div class="n-card"><div class="n-label">Case details</div><div class="n-fields">{details}</div></div>
+<div style="height:.85rem"></div>
+<div class="n-card"><div class="n-label">Legal issues</div>{issues_html}</div>"""
+
+
+def statutes_html(out: dict) -> str:
+    statutes = out.get("statutes_cited") or []
+    if not statutes:
+        return '<div class="n-card n-empty">No statutes were extracted from this judgment.</div>'
+    rows = []
+    for s in statutes:
+        label, tone, tip = STATUTE_STATUS.get(s.get("status"), ("Checked" if s.get("verified") else "Flagged",
+                                                                 "good" if s.get("verified") else "crit", ""))
+        text = s.get("actual_text")
+        details = (f'<details class="n-details"><summary>Statutory text</summary><div>{esc(text)}</div></details>'
+                   if text else "")
+        rows.append(
+            f"<tr><td>{esc(s.get('act') or 'Unknown act')}</td>"
+            f"<td class='n-num'>{esc(_section_ref(s))}</td>"
+            f"<td>{esc(s.get('description')) or '<span class=n-empty>—</span>'}{details}</td>"
+            f"<td>{badge(label, tone, tip)}</td></tr>"
+        )
+    legend = ("<div class='n-legend'>"
+              + badge("In judgment + corpus", "good") + badge("In judgment", "good")
+              + badge("Not in judgment", "crit")
+              + "<span>A statute is flagged when the judgment never mentions it. "
+                "Corpus text is attached where the local statute corpus covers the section.</span></div>")
+    return (f"<div class='n-table-wrap'><table class='n-table'><thead><tr><th>Act</th><th>Section</th>"
+            f"<th>Description</th><th>Validation</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>{legend}")
+
+
+def precedents_html(out: dict) -> str:
+    precedents = out.get("precedents_cited") or []
+    if not precedents:
+        return '<div class="n-card n-empty">No precedents are cited in this judgment.</div>'
+    rows = []
+    for p in precedents:
+        if p.get("resolved"):
+            status = badge("Resolved", "good", f"Matched via {p.get('source') or 'local index'}")
+        elif p.get("grounded"):
+            status = badge("In judgment", "neutral", "Cited in the judgment; not in the local precedent index")
         else:
-            st.success("✅ All fields ≥ 70% confidence.")
-
-    with r5:
-        st.markdown("#### Raw JSON Output")
-        st.json(final_output, expanded=False)
-
-    # ── Export ────────────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("#### 📥 Export")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button(
-            label="⬇️ Download JSON",
-            data=json.dumps(final_output, indent=2, ensure_ascii=False),
-            file_name=f"nyaya_analysis_{int(time.time())}.json",
-            mime="application/json",
-            use_container_width=True,
-            key="dl_json",
+            status = badge("Not in judgment", "crit", "This citation does not appear in the judgment text")
+        court_year = " · ".join(esc(x) for x in (p.get("court"), p.get("year") or None) if x)
+        summary = p.get("summary")
+        details = (f'<details class="n-details"><summary>Summary</summary><div>{esc(summary)}</div></details>'
+                   if summary else "")
+        rows.append(
+            f"<tr><td class='n-num'>{esc(p.get('citation')) or '<span class=n-empty>—</span>'}</td>"
+            f"<td>{esc(p.get('case_name')) or '<span class=n-empty>Unknown</span>'}"
+            f"{f'<div class=n-sub>{court_year}</div>' if court_year else ''}{details}</td>"
+            f"<td>{status}</td></tr>"
         )
-    with c2:
-        lines = [
-            "NYAYA LEGAL AI ANALYSIS",
-            f"Generated: {time.strftime('%Y-%m-%d %H:%M')}",
-            "",
-            f"Case: {final_output.get('case_name','')}",
-            f"Court: {final_output.get('court','')}",
-            f"Year: {final_output.get('year','')}",
-            f"Outcome: {final_output.get('outcome','')}",
-            f"Overall Confidence: {overall_conf:.0%}",
-            "",
-            "HOLDING:",
-            final_output.get("holding", ""),
-            "",
-            "STATUTES CITED:",
-        ]
-        for s in final_output.get("statutes_cited", []):
-            lines.append(f"  - {s.get('act','')} §{s.get('section','')} [{'verified' if s.get('verified') else 'FLAGGED'}]")
-        st.download_button(
-            label="⬇️ Download Text Summary",
-            data="\n".join(lines),
-            file_name=f"nyaya_summary_{int(time.time())}.txt",
-            mime="text/plain",
-            use_container_width=True,
-            key="dl_txt",
+    return (f"<div class='n-table-wrap'><table class='n-table'><thead><tr><th>Citation</th><th>Case</th>"
+            f"<th>Status</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+            f"<div class='n-legend'><span>Citations are matched against the local precedent index; "
+            f"those not in the index are still checked against the judgment text.</span></div>")
+
+
+def confidence_html(out: dict) -> str:
+    scores = out.get("confidence_scores") or {}
+    if not scores:
+        return '<div class="n-card n-empty">No confidence scores available.</div>'
+    rows = []
+    for field, score in scores.items():
+        level, tone = _confidence_level(score)
+        name = FIELD_LABELS.get(field, field.replace("_", " ").capitalize())
+        rows.append(f"""
+<div class="n-meter-row" title="{esc(name)}: {score:.0%} ({level})">
+  <div class="n-meter-label">{esc(name)}</div>
+  <div class="n-meter" style="background:var(--n-{tone}-soft)">
+    <div class="n-meter-fill" style="width:{max(score, 0.02) * 100:.0f}%;background:var(--n-{tone})"></div>
+    <div class="n-meter-threshold" style="left:{CONFIDENCE_THRESHOLD * 100:.0f}%"></div>
+  </div>
+  <div class="n-meter-value">{score:.0%}</div>
+  <div class="n-meter-status">{status_note(level, tone)}</div>
+</div>""")
+    legend = ("<div class='n-legend'>"
+              + badge("High ≥ 85%", "good") + badge("Moderate 70–84%", "warn") + badge("Review < 70%", "crit")
+              + f"<span>The vertical mark is the {CONFIDENCE_THRESHOLD:.0%} review threshold.</span></div>")
+    return f"<div class='n-card'>{''.join(rows)}</div>{legend}"
+
+
+def audit_html(audit: list) -> str:
+    if not audit:
+        return '<div class="n-card n-empty">No audit trail recorded.</div>'
+    rows = []
+    for entry in audit:
+        tone, detail = describe_step(entry)
+        latency = entry.get("latency")
+        rows.append(
+            f"<tr><td>{esc(STEP_NAMES.get(entry.get('agent'), entry.get('agent')))}</td>"
+            f"<td>{badge((entry.get('status') or '').replace('_', ' ').capitalize(), tone)}</td>"
+            f"<td>{esc(detail)}</td>"
+            f"<td class='n-num'>{f'{latency:.2f} s' if isinstance(latency, (int, float)) else '—'}</td></tr>"
         )
+    return (f"<div class='n-table-wrap'><table class='n-table'><thead><tr><th>Agent</th><th>Status</th>"
+            f"<th>Detail</th><th>Time</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>")
 
-    if st.button("🗑️ Clear Results", key="btn_clear"):
-        st.session_state["final_output"]  = None
-        st.session_state["analysis_done"] = False
-        st.session_state["judgment_text"] = ""
-        st.session_state["source_label"]  = ""
-        st.rerun()
 
-elif not st.session_state.get("analysis_done"):
-    st.markdown("""
-    <div style="text-align:center;padding:2.5rem;color:#475569">
-        <div style="font-size:3rem;margin-bottom:1rem">⚖️</div>
-        <p style="font-size:1rem;color:#64748b">
-            Paste a judgment, upload a PDF, or try the sample above —
-            then click <b style="color:#63b3ed">⚡ Analyze Judgment</b>.
-        </p>
-        <p style="font-size:0.85rem;color:#374151;margin-top:0.5rem">
-            First analysis loads <b style="color:#94a3b8">Nyaya-7B</b> locally (~1–2 min). Subsequent runs are faster.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+def text_summary(out: dict) -> str:
+    lines = [
+        "NYAYA — JUDGMENT ANALYSIS",
+        f"Generated: {time.strftime('%Y-%m-%d %H:%M')}",
+        "",
+        f"Case:        {out.get('case_name', '')}",
+        f"Court:       {out.get('court', '')}",
+        f"Year:        {out.get('year') or ''}",
+        f"Citation:    {out.get('citation') or '—'}",
+        f"Outcome:     {out.get('outcome', '')}",
+        f"Confidence:  {(out.get('overall_confidence') or 0):.0%}"
+        + ("  (needs human review)" if out.get("needs_human_review") else ""),
+        "",
+        "HOLDING",
+        out.get("holding", ""),
+        "",
+        "STATUTES CITED",
+    ]
+    for s in out.get("statutes_cited") or []:
+        lines.append(f"  - {s.get('act', '')} {_section_ref(s)}  [{s.get('status') or ('verified' if s.get('verified') else 'flagged')}]")
+    lines += ["", "PRECEDENTS CITED"]
+    for p in out.get("precedents_cited") or []:
+        lines.append(f"  - {p.get('citation', '')}  {p.get('case_name', '')}")
+    lines += ["", "Machine-generated. Verify against the original judgment before relying on it."]
+    return "\n".join(lines)
+
+
+def render_results(result: dict) -> None:
+    out = result.get("final_output")
+    if not out:
+        st.error("The pipeline could not produce a result for this judgment.", icon=":material/error:")
+        for err in result.get("errors") or []:
+            st.code(err, language=None, wrap_lines=True)
+        st.button("Start over", icon=":material/restart_alt:", on_click=_new_analysis, key="btn_restart_failed")
+        return
+
+    for err in result.get("errors") or []:
+        st.warning(err, icon=":material/warning:")
+
+    st.html(case_header_html(out))
+    st.html(kpi_row_html(out))
+
+    n_statutes = len(out.get("statutes_cited") or [])
+    n_precedents = len(out.get("precedents_cited") or [])
+    tabs = st.tabs([
+        ":material/article: Overview",
+        f":material/menu_book: Statutes ({n_statutes})",
+        f":material/account_balance: Precedents ({n_precedents})",
+        ":material/speed: Confidence",
+        ":material/timeline: Audit trail",
+        ":material/data_object: JSON",
+    ])
+    with tabs[0]:
+        st.html(overview_html(out))
+    with tabs[1]:
+        st.html(statutes_html(out))
+    with tabs[2]:
+        st.html(precedents_html(out))
+    with tabs[3]:
+        st.html(confidence_html(out))
+    with tabs[4]:
+        st.caption(f"Source: {result.get('source', '—')} · total time {result.get('elapsed', 0):.1f} s")
+        st.html(audit_html(result.get("audit") or []))
+    with tabs[5]:
+        st.json(out, expanded=1)
+
+    stamp = int(time.time())
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.download_button("Download JSON", data=json.dumps(out, indent=2, ensure_ascii=False),
+                           file_name=f"nyaya_analysis_{stamp}.json", mime="application/json",
+                           icon=":material/download:", key="dl_json")
+        st.download_button("Download summary", data=text_summary(out), file_name=f"nyaya_summary_{stamp}.txt",
+                           mime="text/plain", icon=":material/summarize:", key="dl_txt")
+        st.button("New analysis", icon=":material/add:", type="tertiary", on_click=_new_analysis, key="btn_new")
+
+
+def render_how_it_works() -> None:
+    steps = [
+        ("Extract", "Nyaya-7B reads the judgment on your GPU and returns parties, court, statutes, precedents and the holding as JSON."),
+        ("Validate statutes", "Every cited section must appear in the judgment. Statutory text is attached from the local corpus."),
+        ("Resolve precedents", "Citations are matched against the local precedent index and checked against the judgment text."),
+        ("Score confidence", f"Each field is scored; anything under {CONFIDENCE_THRESHOLD:.0%} is flagged for human review."),
+    ]
+    cards = "".join(
+        f'<div class="n-step"><div class="n-step-num">{i}</div><div class="n-step-title">{esc(title)}</div>'
+        f'<div class="n-step-text">{esc(text)}</div></div>'
+        for i, (title, text) in enumerate(steps, 1)
+    )
+    st.html(f'<div class="n-label" style="margin-top:.5rem">How it works</div><div class="n-steps">{cards}</div>')
+
+
+# ── Page ──────────────────────────────────────────────────────────────────────
+
+inject_css()
+render_sidebar()
+render_topbar()
+st.space("small")
+
+source = render_input(collapsed=bool(st.session_state.get("result")))
+with st.container(horizontal=True, vertical_alignment="center", gap="medium"):
+    analyze_clicked = st.button("Analyze judgment", type="primary", icon=":material/gavel:",
+                                key="btn_analyze", disabled=source is None)
+    st.caption(f"Will analyze: {source[2]}" if source else "Paste a judgment, upload a file, or load the sample to begin.")
+
+if analyze_clicked and source:
+    run_analysis(source)
+
+result = st.session_state.get("result")
+if result:
+    st.space("small")
+    render_results(result)
+else:
+    st.space("small")
+    render_how_it_works()
+
+st.html('<div class="n-footer">Nyaya produces machine-generated analysis. Verify every field against the original '
+        'judgment before relying on it for legal work.</div>')

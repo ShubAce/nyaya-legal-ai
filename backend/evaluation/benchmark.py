@@ -206,20 +206,12 @@ class NyayaFinetunedSystem(BaseSystem):
     cost_per_1k_input_tokens = 0.0
 
     def __init__(self):
-        from agents.extraction_agent import _load_pipeline
-        self.pipe = _load_pipeline()
+        from agents.extraction_agent import load_model
+        load_model()
 
     def predict(self, judgment_text: str) -> tuple[str, dict]:
-        messages = [
-            {"role": "system", "content": "You are Nyaya, a specialized Indian legal extraction model."},
-            {"role": "user", "content": f"Extract structured data from this judgment and return JSON:\n\n{judgment_text[:3000]}"}
-        ]
-        prompt = self.pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        raw = self.pipe(
-            prompt, max_new_tokens=512, do_sample=False,
-            return_full_text=False,
-            pad_token_id=self.pipe.tokenizer.eos_token_id,
-        )[0]["generated_text"]
+        from agents.extraction_agent import generate_extraction
+        raw = generate_extraction(judgment_text)
         return raw, _parse_output(raw)
 
 

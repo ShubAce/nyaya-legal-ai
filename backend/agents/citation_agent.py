@@ -1,249 +1,239 @@
 """
 citation_agent.py — Agent 3: Resolve Indian legal citations (AIR, SCC, SCR, etc.)
-to full case names and summaries using the local ChromaDB precedent index
-with IndianKanoon API as a fallback.
+to full case names and summaries using the local ChromaDB precedent index.
+
+Citations are matched on their parsed (reporter, year, volume, page) parts, so
+"AIR 1987 SC 943" and "1987 AIR 943" resolve to the same case; case names are
+fuzzy-matched as a fallback. The IndianKanoon API is a paid online service and
+is only queried when USE_INDIANKANOON=1 is set in backend/.env.
 """
 
-import os
 import re
 import time
-import httpx
+from difflib import SequenceMatcher
 from functools import lru_cache
-from pathlib import Path
+from typing import Optional
 
-import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+import httpx
 from loguru import logger
-from dotenv import load_dotenv
 
+from agents.config import INDIANKANOON_API_KEY, USE_INDIANKANOON, get_collection
 from agents.state import LegalExtractionState
 
-load_dotenv()
-
-CHROMA_PRECEDENT_PATH  = Path(os.getenv("CHROMA_PRECEDENT_PATH", "data/chroma_precedents"))
-INDIANKANOON_API_KEY   = os.getenv("INDIANKANOON_API_KEY", "")
-EMBED_MODEL            = "BAAI/bge-base-en-v1.5"
-
-# Indian legal citation regex patterns
+# Citations found in the raw text that the model may have missed.
 CITATION_PATTERNS = [
-    r"AIR\s+\d{4}\s+SC\s+\d+",          # AIR 1984 SC 1622
-    r"AIR\s+\d{4}\s+\w+\s+\d+",         # AIR 1984 Bom 123
-    r"\(\d{4}\)\s+\d+\s+SCC\s+\d+",     # (2019) 5 SCC 1
-    r"\d{4}\s+\(\d+\)\s+SCC\s+\d+",     # 2019 (5) SCC 1
-    r"\d{4}\s+SCR\s+\d+",               # 1984 SCR 622
-    r"\d{4}\s+Cri\s*LJ\s+\d+",          # 2001 Cri LJ 1234
+    r"AIR\s+\d{4}\s+[A-Z][A-Za-z]*\s+\d+",       # AIR 1984 SC 1622
+    r"\(\d{4}\)\s+\d+\s+SCC\s+\d+",              # (2019) 5 SCC 1
+    r"\d{4}\s+\(\d+\)\s+SCC\s+\d+",              # 2019 (5) SCC 1
+    r"\[\d{4}\]\s+\d+\s+SCR\s+\d+",              # [1984] 2 SCR 622
+    r"\d{4}\s+SCR\s+(?:\(\d+\)\s+)?\d+",         # 1984 SCR 622 / 1987 SCR (2) 444
+    r"\d{4}\s+Cri\s*LJ\s+\d+",                   # 2001 Cri LJ 1234
+]
+COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in CITATION_PATTERNS]
+
+# Parsers that turn any citation format into a comparable key.
+_KEY_PATTERNS = [
+    (re.compile(r"AIR\s*(\d{4})\s*[A-Z][A-Za-z.]*\s*(\d+)", re.I),     lambda m: ("AIR", m[1], m[2])),
+    (re.compile(r"(\d{4})\s*AIR\s*(\d+)", re.I),                       lambda m: ("AIR", m[1], m[2])),
+    (re.compile(r"\((\d{4})\)\s*(\d+)\s*SCC\s*(\d+)", re.I),           lambda m: ("SCC", m[1], m[2], m[3])),
+    (re.compile(r"(\d{4})\s*\((\d+)\)\s*SCC\s*(\d+)", re.I),           lambda m: ("SCC", m[1], m[2], m[3])),
+    (re.compile(r"(\d{4})\s*SCC\s*\((\d+)\)\s*(\d+)", re.I),           lambda m: ("SCC", m[1], m[2], m[3])),
+    (re.compile(r"\[(\d{4})\]\s*\d+\s*SCR\s*(\d+)", re.I),             lambda m: ("SCR", m[1], m[2])),
+    (re.compile(r"(\d{4})\s*SCR\s*(?:\(\d+\)\s*)?(\d+)", re.I),        lambda m: ("SCR", m[1], m[2])),
+    (re.compile(r"(\d{4})\s*Cri\s*\.?\s*L\.?\s*J\.?\s*(\d+)", re.I),   lambda m: ("CRILJ", m[1], m[2])),
 ]
 
-COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in CITATION_PATTERNS]
+
+def citation_keys(text: str) -> set[tuple]:
+    keys = set()
+    for pattern, to_key in _KEY_PATTERNS:
+        keys.update(to_key(m) for m in pattern.finditer(text))
+    return keys
+
+
+def _normalize_name(name: str) -> str:
+    name = re.sub(r"\b(versus|vs\.?|v\.?)\b", " v ", name.lower())
+    name = re.sub(r"\b(and|&)?\s*(anr|ors|others|another)\b\.?", " ", name)
+    return re.sub(r"[^a-z ]+", " ", re.sub(r"\s+", " ", name)).strip()
 
 
 @lru_cache(maxsize=1)
-def _load_precedent_collection():
-    """Load ChromaDB precedent collection once and cache."""
-    logger.info(f"Loading precedent ChromaDB from: {CHROMA_PRECEDENT_PATH}")
-    ef = SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
-    client = chromadb.PersistentClient(path=str(CHROMA_PRECEDENT_PATH))
-    try:
-        collection = client.get_collection("precedents", embedding_function=ef)
-        logger.success(f"Precedent collection loaded: {collection.count()} cases")
-        return collection
-    except Exception as e:
-        logger.warning(f"Precedent collection not found: {e}. Run build_knowledge_base.py first.")
-        return None
-
-
-def _normalize_citation(citation: str) -> str:
-    """Normalize citation string for consistent lookup."""
-    return re.sub(r"\s+", " ", citation.strip()).upper()
-
-
-def _lookup_local_index(collection, citation: str) -> dict | None:
-    """Try exact ID lookup, then semantic search in local ChromaDB."""
+def _precedent_index() -> tuple[dict, list]:
+    """Load every precedent once: ({citation_key: case}, [(normalised_name, case)])."""
+    collection = get_collection("precedents")
     if collection is None:
-        return None
+        return {}, []
+    data = collection.get(include=["documents", "metadatas"])
+    by_key, by_name = {}, []
+    for doc, meta in zip(data["documents"], data["metadatas"]):
+        case = {
+            "case_name": meta.get("case_name", ""),
+            "court":     meta.get("court", ""),
+            "year":      meta.get("year", 0),
+            "outcome":   meta.get("outcome", ""),
+            "summary":   (doc or "")[:300],
+            "citation":  meta.get("citation", ""),
+        }
+        for key in citation_keys(case["citation"]):
+            by_key[key] = case
+        if case["case_name"]:
+            by_name.append((_normalize_name(case["case_name"]), case))
+    return by_key, by_name
 
-    # Strategy 1: exact ID match
-    normalized = _normalize_citation(citation).replace(" ", "_")[:100]
-    try:
-        result = collection.get(ids=[normalized], include=["documents", "metadatas"])
-        if result["documents"] and result["documents"][0]:
-            meta = result["metadatas"][0]
-            return {
-                "resolved":  True,
-                "source":    "local_exact",
-                "case_name": meta.get("case_name", ""),
-                "court":     meta.get("court", ""),
-                "year":      meta.get("year", 0),
-                "outcome":   meta.get("outcome", ""),
-                "summary":   result["documents"][0][:300],
-            }
-    except Exception:
-        pass
 
-    # Strategy 2: semantic search
-    try:
-        results = collection.query(
-            query_texts=[citation],
-            n_results=1,
-            include=["documents", "metadatas", "distances"],
-        )
-        if results["distances"] and results["distances"][0] and results["distances"][0][0] < 0.25:
-            meta = results["metadatas"][0][0]
-            return {
-                "resolved":  True,
-                "source":    "local_semantic",
-                "case_name": meta.get("case_name", ""),
-                "court":     meta.get("court", ""),
-                "year":      meta.get("year", 0),
-                "outcome":   meta.get("outcome", ""),
-                "summary":   results["documents"][0][0][:300],
-            }
-    except Exception:
-        pass
+def _lookup_local_index(citation: str, case_name: str) -> Optional[dict]:
+    by_key, by_name = _precedent_index()
+    for key in citation_keys(citation):
+        if key in by_key:
+            return {"resolved": True, "source": "local_index", **by_key[key]}
 
+    wanted = _normalize_name(case_name)
+    if len(wanted) >= 8:
+        best_score, best = max(((SequenceMatcher(None, wanted, name).ratio(), case)
+                                for name, case in by_name), default=(0.0, None), key=lambda x: x[0])
+        if best_score >= 0.85:
+            return {"resolved": True, "source": "local_index_name", **best}
     return None
 
 
-def _lookup_indiankanoon(citation: str) -> dict | None:
-    """Query IndianKanoon API for a citation."""
-    if not INDIANKANOON_API_KEY:
+def _lookup_indiankanoon(citation: str) -> Optional[dict]:
+    """Query the IndianKanoon search API (only when USE_INDIANKANOON=1)."""
+    if not USE_INDIANKANOON:
         return None
-
     try:
-        # Search endpoint
-        url     = "https://api.indiankanoon.org/search/"
-        headers = {"Authorization": f"Token {INDIANKANOON_API_KEY}"}
-        params  = {"formInput": citation, "pagenum": 0}
-
-        r = httpx.get(url, headers=headers, params=params, timeout=8.0)
-        time.sleep(0.3)  # Rate limit
-
+        r = httpx.post(
+            "https://api.indiankanoon.org/search/",
+            headers={"Authorization": f"Token {INDIANKANOON_API_KEY}"},
+            data={"formInput": citation, "pagenum": 0},
+            timeout=8.0,
+        )
         if r.status_code != 200:
             return None
-
-        data = r.json()
-        docs = data.get("docs", [])
-
+        docs = r.json().get("docs", [])
         if not docs:
             return None
-
         first = docs[0]
+        publish_date = first.get("publishdate") or ""
         return {
             "resolved":  True,
             "source":    "indiankanoon_api",
-            "case_name": first.get("title", ""),
+            "case_name": re.sub(r"<[^>]+>", "", first.get("title", "")),
             "court":     first.get("docsource", ""),
-            "year":      int(first.get("publishdate", "0000")[:4]) if first.get("publishdate") else 0,
+            "year":      int(publish_date[:4]) if publish_date[:4].isdigit() else 0,
             "outcome":   "",
-            "summary":   first.get("headline", "")[:300],
+            "summary":   re.sub(r"<[^>]+>", "", first.get("headline", ""))[:300],
             "ik_doc_id": first.get("tid", ""),
         }
-
     except Exception as e:
         logger.debug(f"IndianKanoon lookup failed for '{citation}': {e}")
         return None
 
 
 def _extract_citations_from_text(text: str) -> list[str]:
-    """Find all legal citations in text that weren't extracted by the model."""
-    found = set()
+    found = []
     for pattern in COMPILED_PATTERNS:
         for match in pattern.finditer(text):
-            found.add(match.group().strip())
-    return list(found)
+            cit = re.sub(r"\s+", " ", match.group()).strip()
+            if cit not in found:
+                found.append(cit)
+    return found
 
 
-def citation_resolution_agent(state: LegalExtractionState) -> LegalExtractionState:
+def _find_citation_near_name(case_name: str, judgment_text: str) -> str:
+    """The model sometimes returns a case name but no citation; look right after the name in the text."""
+    first_party = re.split(r"\s+(?:v\.?|vs\.?|versus)\s+", case_name, maxsplit=1, flags=re.I)[0].strip()
+    if len(first_party) < 4:
+        return ""
+    idx = re.sub(r"\s+", " ", judgment_text).lower().find(first_party.lower())
+    if idx == -1:
+        return ""
+    window = re.sub(r"\s+", " ", judgment_text)[idx: idx + len(case_name) + 150]
+    for pattern in COMPILED_PATTERNS:
+        match = pattern.search(window)
+        if match:
+            return match.group().strip()
+    return ""
+
+
+def _is_grounded(citation: str, text_keys: set, text_normalized: str) -> bool:
+    """True if the citation (or its reporter/year/page) appears in the judgment."""
+    keys = citation_keys(citation)
+    if keys:
+        return bool(keys & text_keys)
+    return re.sub(r"\s+", " ", citation.lower()).strip() in text_normalized
+
+
+def citation_resolution_agent(state: LegalExtractionState) -> dict:
     """
     Agent 3: Resolve each precedent citation to a full case name + summary.
 
     Resolution strategy (in order):
-        1. Local ChromaDB exact ID match
-        2. Local ChromaDB semantic search
-        3. IndianKanoon API
-        4. Unresolved (kept with original data)
+        1. Local precedent index — citation match, then fuzzy case-name match
+        2. IndianKanoon API (opt-in)
+        3. Unresolved (kept with the model's data)
 
-    Also finds additional citations in the raw text that the extraction
-    model may have missed.
-
-    Writes to state:
-        - resolved_precedents: list of enriched citation objects
-        - audit_trail: appends resolution event
+    Also adds citations found in the raw text that the model missed, and marks
+    whether each citation actually appears in the judgment (`grounded`).
     """
-    audit  = state.get("audit_trail", [])
-    errors = state.get("errors", [])
+    extraction = state.get("raw_extraction") or {}
+    judgment_text = state.get("judgment_text") or ""
+    text_keys = citation_keys(judgment_text)
+    text_normalized = re.sub(r"\s+", " ", judgment_text.lower())
 
-    extraction = state.get("raw_extraction", {})
-    if not extraction:
-        audit.append({"agent": "citation_resolution", "status": "skipped", "reason": "no_extraction"})
-        return {**state, "resolved_precedents": [], "audit_trail": audit}
+    citations = [dict(c) for c in extraction.get("precedents_cited") or []]
+    for cite in citations:
+        if not cite.get("citation") and cite.get("case_name"):
+            cite["citation"] = _find_citation_near_name(cite["case_name"], judgment_text)
+    seen_keys = set().union(*(citation_keys(c.get("citation", "")) for c in citations))
+    seen_raw = {c.get("citation", "") for c in citations}
 
-    citations_from_model = extraction.get("precedents_cited", [])
+    extra_found = 0
+    for cit in _extract_citations_from_text(judgment_text):
+        keys = citation_keys(cit)
+        if (keys and keys & seen_keys) or (not keys and cit in seen_raw):
+            continue
+        citations.append({"citation": cit, "case_name": "", "from_text_scan": True})
+        seen_keys |= keys
+        extra_found += 1
 
-    # Also find citations the model may have missed
-    raw_text = state.get("judgment_text", "")
-    extra_citations_str = _extract_citations_from_text(raw_text)
-    model_citation_strs = {c.get("citation") or "" for c in citations_from_model}
-
-    # Add missed citations
-    for cit_str in extra_citations_str:
-        if cit_str not in model_citation_strs:
-            citations_from_model.append({"citation": cit_str, "case_name": None})
-
-    collection = _load_precedent_collection()
-    resolved, unresolved = [], []
+    precedents = []
     t0 = time.time()
-
-    for cite in citations_from_model:
+    for cite in citations:
         citation_str = (cite.get("citation") or "").strip()
-        if not citation_str:
+        model_name = cite.get("case_name") or ""
+        if not citation_str and not model_name:
             continue
 
-        result = (
-            _lookup_local_index(collection, citation_str)
-            or _lookup_indiankanoon(citation_str)
+        base = {
+            "original_citation": citation_str,
+            "model_case_name":   model_name,
+            "grounded":          _is_grounded(citation_str, text_keys, text_normalized) if citation_str else False,
+            "from_text_scan":    cite.get("from_text_scan", False),
+        }
+        result = _lookup_local_index(citation_str, model_name) or (
+            _lookup_indiankanoon(citation_str) if citation_str else None
         )
-
         if result:
-            enriched = {
-                "original_citation": citation_str,
-                "model_case_name":   cite.get("case_name"),
-                **result,
-            }
-            resolved.append(enriched)
+            precedents.append({**base, **result})
         else:
-            unresolved.append({
-                "original_citation": citation_str,
-                "model_case_name":   cite.get("case_name"),
-                "resolved":          False,
-                "source":            "unresolved",
-            })
-            logger.debug(f"Could not resolve citation: {citation_str}")
+            precedents.append({**base, "resolved": False, "source": "unresolved"})
 
-    all_precedents = resolved + unresolved
-    elapsed = time.time() - t0
-    resolution_rate = len(resolved) / len(all_precedents) if all_precedents else 0.0
-
-    audit.append({
-        "agent":              "citation_resolution",
-        "status":             "complete",
-        "total_citations":    len(all_precedents),
-        "resolved_count":     len(resolved),
-        "unresolved_count":   len(unresolved),
-        "resolution_rate":    round(resolution_rate, 3),
-        "extra_found":        len(extra_citations_str) - len([c for c in citations_from_model
-                                                              if c.get("citation") in model_citation_strs]),
-        "latency":            round(elapsed, 2),
-    })
-
-    logger.info(
-        f"Citation resolution: {len(resolved)}/{len(all_precedents)} resolved "
-        f"({resolution_rate:.0%}) in {elapsed:.1f}s"
-    )
+    resolved_count = sum(1 for p in precedents if p["resolved"])
+    elapsed = round(time.time() - t0, 2)
+    logger.info(f"Citation resolution: {resolved_count}/{len(precedents)} resolved in {elapsed:.1f}s")
 
     return {
-        **state,
-        "resolved_precedents": all_precedents,
-        "audit_trail":         audit,
-        "errors":              errors,
+        "resolved_precedents": precedents,
+        "audit_trail": [{
+            "agent":            "citation_resolution",
+            "status":           "complete",
+            "total_citations":  len(precedents),
+            "resolved_count":   resolved_count,
+            "unresolved_count": len(precedents) - resolved_count,
+            "grounded_count":   sum(1 for p in precedents if p["grounded"]),
+            "resolution_rate":  round(resolved_count / len(precedents), 3) if precedents else 0.0,
+            "extra_found":      extra_found,
+            "indiankanoon":     USE_INDIANKANOON,
+            "latency":          elapsed,
+        }],
     }

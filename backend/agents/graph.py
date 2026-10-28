@@ -1,9 +1,16 @@
 """
-graph.py — Phase 4: LangGraph pipeline wiring all four agents into a
-directed graph with a final assembly node.
+graph.py — LangGraph pipeline wiring the four agents plus a final assembly node.
 
 Pipeline:
-    extraction → statute_validation → citation_resolution → confidence_scoring → assembly → END
+
+                     ┌─> validate_statutes ──┐
+    extract ── ok ───┤                       ├─> score_confidence ─> assemble ─> END
+       │             └─> resolve_precedents ─┘                          ^
+       └── extraction failed ───────────────────────────────────────────┘
+
+Statute validation and precedent resolution are independent, so they run in
+parallel. If the model output cannot be parsed, the graph skips straight to
+assembly, which reports the failure instead of an empty "successful" result.
 
 Usage:
     from agents.graph import build_pipeline, run_pipeline
@@ -13,17 +20,19 @@ Usage:
 """
 
 import json
+import sys
 import time
+from pathlib import Path
 from typing import Iterator
 
-import sys
-from pathlib import Path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from agents import config  # noqa: F401  — offline mode + paths, before any model library loads
 
 # Import datasets first to resolve Windows OpenMP/CUDA DLL collision between PyArrow and PyTorch
-import datasets
+import datasets  # noqa: F401
 
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, START, END
 from loguru import logger
 
 from agents.state import LegalExtractionState
@@ -35,32 +44,37 @@ from agents.confidence_agent  import confidence_scoring_agent
 
 # ── Final assembly node ───────────────────────────────────────────────────────
 
-def assembly_agent(state: LegalExtractionState) -> LegalExtractionState:
+def assembly_agent(state: LegalExtractionState) -> dict:
     """
     Final node: assemble the complete enriched output from all agent outputs.
-    Merges raw extraction with validation/resolution results.
+    Leaves final_output as None when extraction failed.
     """
-    extraction   = state.get("raw_extraction", {}) or {}
-    validated    = state.get("validated_statutes", []) or []
-    hallucinated = state.get("hallucinated_statutes", []) or []
-    resolved     = state.get("resolved_precedents", []) or []
-    confidence   = state.get("per_field_confidence", {}) or {}
-    uncertain    = state.get("uncertain_fields", []) or []
-    audit        = state.get("audit_trail", [])
+    extraction = state.get("raw_extraction")
+    if not extraction:
+        logger.error("Assembly: nothing to assemble because extraction failed")
+        return {
+            "final_output": None,
+            "audit_trail":  [{"agent": "assembly", "status": "failed", "reason": "no_extraction"}],
+        }
 
-    # Build enriched statutes list
+    validated    = state.get("validated_statutes") or []
+    hallucinated = state.get("hallucinated_statutes") or []
+    resolved     = state.get("resolved_precedents") or []
+    confidence   = state.get("per_field_confidence") or {}
+    uncertain    = state.get("uncertain_fields") or []
+
     all_statutes = [
         {
-            "act":       s.get("act", ""),
-            "section":   s.get("section", ""),
+            "act":         s.get("act", ""),
+            "section":     s.get("section", ""),
             "description": s.get("description", ""),
-            "verified":  s.get("verified", False),
+            "verified":    s.get("verified", False),
+            "status":      s.get("status", ""),
             "actual_text": s.get("actual_text"),
         }
         for s in (validated + hallucinated)
     ]
 
-    # Build enriched precedents list
     enriched_precedents = [
         {
             "citation":  r.get("original_citation", ""),
@@ -68,6 +82,7 @@ def assembly_agent(state: LegalExtractionState) -> LegalExtractionState:
             "court":     r.get("court", ""),
             "year":      r.get("year", 0),
             "resolved":  r.get("resolved", False),
+            "grounded":  r.get("grounded", False),
             "source":    r.get("source", ""),
             "summary":   r.get("summary", ""),
         }
@@ -90,128 +105,101 @@ def assembly_agent(state: LegalExtractionState) -> LegalExtractionState:
         "outcome_label":  extraction.get("outcome_label"),
 
         # Enriched by agents
-        "statutes_cited":         all_statutes,
-        "precedents_cited":       enriched_precedents,
+        "statutes_cited":   all_statutes,
+        "precedents_cited": enriched_precedents,
 
         # Quality metadata
-        "hallucinated_statutes":  [(s.get("act") or "Unknown Act") + " §" + (s.get("section") or "?") for s in hallucinated],
-        "confidence_scores":      confidence,
-        "overall_confidence":     state.get("overall_confidence", 0.0),
-        "uncertain_fields":       uncertain,
-        "needs_human_review":     len(uncertain) > 0 or len(hallucinated) > 0,
+        "hallucinated_statutes": [f"{s.get('act') or 'Unknown Act'} §{s.get('section') or '?'}" for s in hallucinated],
+        "confidence_scores":     confidence,
+        "overall_confidence":    state.get("overall_confidence") or 0.0,
+        "uncertain_fields":      uncertain,
+        "needs_human_review":    len(uncertain) > 0 or len(hallucinated) > 0,
     }
 
     logger.info(
         f"Assembly complete — "
-        f"overall_confidence={state.get('overall_confidence', 0):.2f}, "
+        f"overall_confidence={final_output['overall_confidence']:.2f}, "
         f"hallucinations={len(hallucinated)}, "
         f"needs_review={final_output['needs_human_review']}"
     )
 
     return {
-        **state,
         "final_output": final_output,
-        "audit_trail":  audit + [{
-            "agent":  "assembly",
-            "status": "complete",
-            "fields": list(final_output.keys()),
-        }],
+        "audit_trail":  [{"agent": "assembly", "status": "complete", "fields": list(final_output.keys())}],
     }
 
 
 # ── Graph definition ──────────────────────────────────────────────────────────
 
-def build_pipeline() -> StateGraph:
+def _route_after_extraction(state: LegalExtractionState):
+    if state.get("raw_extraction"):
+        return ["validate_statutes", "resolve_precedents"]
+    return "assemble"
+
+
+def build_pipeline():
     """Build and compile the full LangGraph pipeline."""
     graph = StateGraph(LegalExtractionState)
 
-    # Add nodes
     graph.add_node("extract",            extraction_agent)
     graph.add_node("validate_statutes",  rag_validation_agent)
     graph.add_node("resolve_precedents", citation_resolution_agent)
     graph.add_node("score_confidence",   confidence_scoring_agent)
     graph.add_node("assemble",           assembly_agent)
 
-    # Wire edges (sequential pipeline)
-    graph.set_entry_point("extract")
-    graph.add_edge("extract",            "validate_statutes")
-    graph.add_edge("validate_statutes",  "resolve_precedents")
-    graph.add_edge("resolve_precedents", "score_confidence")
-    graph.add_edge("score_confidence",   "assemble")
-    graph.add_edge("assemble",           END)
+    graph.add_edge(START, "extract")
+    graph.add_conditional_edges(
+        "extract", _route_after_extraction,
+        ["validate_statutes", "resolve_precedents", "assemble"],
+    )
+    graph.add_edge(["validate_statutes", "resolve_precedents"], "score_confidence")
+    graph.add_edge("score_confidence", "assemble")
+    graph.add_edge("assemble", END)
 
     compiled = graph.compile()
-    logger.info("LangGraph pipeline compiled: 5 nodes, sequential")
+    logger.info("LangGraph pipeline compiled: extract -> (statutes || precedents) -> confidence -> assemble")
     return compiled
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _initial_state(judgment_text: str) -> LegalExtractionState:
+    return {"judgment_text": judgment_text, "audit_trail": [], "errors": []}
+
+
 def run_pipeline(pipeline, judgment_text: str) -> dict:
     """
     Run the full pipeline on a judgment text.
-    Returns the final state including final_output and audit_trail.
+    Returns the final state including final_output, audit_trail and errors.
     """
-    initial_state: LegalExtractionState = {
-        "judgment_text":         judgment_text,
-        "raw_extraction":        None,
-        "validated_statutes":    None,
-        "hallucinated_statutes": None,
-        "resolved_precedents":   None,
-        "per_field_confidence":  None,
-        "uncertain_fields":      None,
-        "overall_confidence":    None,
-        "final_output":          None,
-        "audit_trail":           [],
-        "errors":                [],
-    }
-
     t0 = time.time()
-    result = pipeline.invoke(initial_state)
-    elapsed = time.time() - t0
-
-    logger.info(f"Pipeline complete in {elapsed:.1f}s")
+    result = pipeline.invoke(_initial_state(judgment_text))
+    logger.info(f"Pipeline complete in {time.time() - t0:.1f}s")
     return result
 
 
 def stream_pipeline(pipeline, judgment_text: str) -> Iterator[dict]:
     """
     Stream pipeline events as each agent completes.
-    Yields dicts with {agent, status, partial_output} for SSE streaming.
+    Yields {node, status, audit_trail, final_output, overall_confidence, errors}
+    where audit_trail / errors hold only that node's new entries.
     """
-    initial_state: LegalExtractionState = {
-        "judgment_text":         judgment_text,
-        "raw_extraction":        None,
-        "validated_statutes":    None,
-        "hallucinated_statutes": None,
-        "resolved_precedents":   None,
-        "per_field_confidence":  None,
-        "uncertain_fields":      None,
-        "overall_confidence":    None,
-        "final_output":          None,
-        "audit_trail":           [],
-        "errors":                [],
-    }
-
-    for event in pipeline.stream(initial_state):
-        # LangGraph stream yields {node_name: state_update} dicts
-        for node_name, state_update in event.items():
+    for event in pipeline.stream(_initial_state(judgment_text), stream_mode="updates"):
+        for node_name, update in event.items():
+            update = update or {}
             yield {
-                "node":             node_name,
-                "status":           "complete",
-                "audit_trail":      state_update.get("audit_trail", [])[-1:],  # last event only
-                "final_output":     state_update.get("final_output"),
-                "overall_confidence": state_update.get("overall_confidence"),
-                "errors":           state_update.get("errors", []),
+                "node":               node_name,
+                "status":             "complete",
+                "audit_trail":        update.get("audit_trail", []),
+                "final_output":       update.get("final_output"),
+                "overall_confidence": update.get("overall_confidence"),
+                "errors":             update.get("errors", []),
             }
 
 
 # ── CLI for quick testing ─────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    import sys
-
-    SAMPLE_JUDGMENT = """
+SAMPLE_JUDGMENT = """
 IN THE SUPREME COURT OF INDIA
 Criminal Appeal No. 1481 of 2018
 (Arising out of SLP (Crl.) No. 9525 of 2017)
@@ -249,6 +237,8 @@ erroneously discarded. The chain of evidence was complete and consistent with
 the guilt of the accused.
 """
 
+
+if __name__ == "__main__":
     if len(sys.argv) > 1:
         with open(sys.argv[1], encoding="utf-8") as f:
             text = f.read()
@@ -262,7 +252,7 @@ the guilt of the accused.
     print("\n" + "=" * 60)
     print("FINAL OUTPUT")
     print("=" * 60)
-    print(json.dumps(result["final_output"], indent=2, ensure_ascii=False))
+    print(json.dumps(result.get("final_output"), indent=2, ensure_ascii=False))
 
     print("\n" + "=" * 60)
     print("AUDIT TRAIL")

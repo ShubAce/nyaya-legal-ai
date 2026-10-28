@@ -6,35 +6,33 @@
 
 ## Project Architecture Overview
 
+Everything runs locally: the finetuned model is loaded from disk onto your GPU
+and nothing is downloaded from the Hugging Face Hub at runtime.
+
 ```
 Raw Judgment PDF / Text
         │
         ▼
 ┌───────────────────┐
-│  Extraction Agent │  ◄── Nyaya-7B (your finetuned model)
-│  (Nyaya-7B)       │
+│  Extraction Agent │  ◄── Nyaya-7B (local merged checkpoint, 4-bit on GPU)
 └────────┬──────────┘
-         │ structured JSON (draft)
-         ▼
-┌───────────────────┐
-│  Validation Agent │  ◄── RAG over IPC + CrPC + Constitution
-│  (Statute RAG)    │       (ChromaDB)
-└────────┬──────────┘
-         │ validated + enriched JSON
-         ▼
-┌───────────────────┐
-│  Precedent Agent  │  ◄── Citation resolver (IndianKanoon API
-│  (Citation RAG)   │       + local Chroma index)
-└────────┬──────────┘
-         │ final enriched JSON
-         ▼
-┌───────────────────┐
-│  Confidence Scorer│  ◄── Per-field uncertainty scoring
-│  + Audit Trail    │       (Uncertainty analysis)
-└────────┬──────────┘
-         │
-         ▼
-   FastAPI Backend → Next.js Dashboard + HuggingFace Space
+         │ structured JSON (or → Assembly with an error if unparseable)
+         ├──────────────────────────────┐
+         ▼                              ▼
+┌───────────────────┐        ┌───────────────────┐
+│ Statute Validation│        │ Precedent Resolver│   (run in parallel)
+│ grounded in the   │        │ local Chroma index│
+│ judgment + corpus │        │ + text scan       │
+└────────┬──────────┘        └────────┬──────────┘
+         └──────────────┬─────────────┘
+                        ▼
+              ┌───────────────────┐
+              │ Confidence Scorer │  ◄── Per-field uncertainty scoring
+              └────────┬──────────┘
+                       ▼
+              ┌───────────────────┐
+              │     Assembly      │  ──► FastAPI (SSE) ──► Streamlit UI
+              └───────────────────┘
 ```
 
 ---
@@ -43,60 +41,59 @@ Raw Judgment PDF / Text
 
 ```
 nyaya-legal-ai/
-├── data/
-│   ├── raw/                    # downloaded judgment text files
-│   ├── processed/              # instruction-tuning JSONL
-│   ├── statute_corpus/         # IPC, CrPC, Constitution text
-│   └── test_set/               # 500 held-out judgments — NEVER TOUCH DURING TRAINING
-├── finetuning/
-│   ├── prepare_dataset.py      # data cleaning + formatting
-│   ├── train.py                # QLoRA training script
-│   ├── evaluate_model.py       # perplexity + JSON validity checks
-│   └── merge_and_push.py       # merge LoRA weights + push to HF Hub
-├── agents/
-│   ├── graph.py                # LangGraph pipeline definition
-│   ├── state.py                # shared LangGraph state schema
-│   ├── extraction_agent.py     # calls Nyaya-7B
-│   ├── rag_agent.py            # statute validation via ChromaDB
-│   ├── citation_agent.py       # precedent resolver
-│   └── confidence_agent.py     # per-field confidence scoring (NEW)
-├── evaluation/
-│   ├── benchmark.py            # runs all 4 systems on test set
-│   ├── metrics.py              # F1, accuracy, hallucination rate
-│   └── results/                # saved benchmark JSONs + charts
-├── api/                        # FastAPI backend
-│   ├── main.py
-│   ├── tasks.py                # Celery task definitions
-│   └── schemas.py
-├── demo/                       # HuggingFace Gradio space
-├── notebooks/                  # Kaggle training notebooks
-├── docker-compose.yml
-└── README.md
+└── backend/
+    ├── agents/                 # LangGraph pipeline
+    │   ├── config.py           # paths, offline mode, cached ChromaDB collections
+    │   ├── graph.py            # pipeline definition (+ CLI: python -m agents.graph)
+    │   ├── state.py            # shared state schema
+    │   ├── extraction_agent.py # runs Nyaya-7B locally
+    │   ├── rag_agent.py        # statute validation
+    │   ├── citation_agent.py   # precedent resolver
+    │   └── confidence_agent.py # per-field confidence scoring
+    ├── api/                    # FastAPI backend (main.py, schemas.py)
+    ├── streamlit_app.py        # Streamlit UI (talks to the API)
+    ├── data/                   # statute corpus, ChromaDB indexes, test set
+    ├── kaggle/                 # local model checkpoints (git-ignored)
+    ├── finetuning/             # dataset prep, QLoRA training, merge
+    ├── notebooks/              # Kaggle training notebook
+    ├── evaluation/             # benchmark, metrics, adversarial tests
+    └── scripts/                # knowledge-base builders, active learning
 ```
 
-## Quick Start
+## Quick Start (local)
 
-1. **Install Base Dependencies:**
+Requirements: an NVIDIA GPU with at least 6 GB of VRAM, and the merged model at
+`backend/kaggle/nyaya7b-finetuning-output/nyaya-checkpoints/nyaya-7b-merged`
+(or set `FINETUNED_MODEL_PATH` in `backend/.env`).
+
+1. **Install dependencies** (inside `backend/`):
    ```bash
-   pip install transformers==4.44.0 trl peft bitsandbytes accelerate \
-               datasets sentencepiece wandb langchain langgraph \
-               chromadb fastapi celery redis httpx gradio pydantic
+   pip install torch --index-url https://download.pytorch.org/whl/cu121
+   pip install -r requirements.txt
    ```
 
-2. **Run API Service:**
-   ```bash
-   uvicorn api.main:app --reload --port 8000
+2. **Start the API and UI** — double-click `backend\run.bat`, or run it from `backend/`.
+   It uses the project venv (`backend\.nyaya`) so the system/Anaconda Python is never used.
+   The model loads onto the GPU in the background (~30–40 s). API docs: http://127.0.0.1:8000/docs
+
+3. **Or start them by hand** — activate the venv first, otherwise `python` is Anaconda's:
+   ```bat
+   cd backend
+   .nyaya\Scripts\activate
+   python -m api.main                 &:: terminal 1
+   streamlit run streamlit_app.py     &:: terminal 2 (activate the venv there too)
    ```
 
-3. **Launch Gradio UI Demo:**
+4. **Or run the pipeline straight from the command line:**
    ```bash
-   python demo/app.py
+   python -m agents.graph                 # built-in sample judgment
+   python -m agents.graph judgment.txt    # your own file
    ```
 
-4. **Docker Compose:**
-   ```bash
-   docker-compose up --build
-   ```
+The embedding model (`BAAI/bge-base-en-v1.5`) must already be in your local
+Hugging Face cache; it is read offline. Set `HF_HUB_OFFLINE=0` only if you need to
+download it once. IndianKanoon lookups are off by default; set
+`USE_INDIANKANOON=1` and `INDIANKANOON_API_KEY` in `backend/.env` to enable them.
 
 ---
 
@@ -110,4 +107,3 @@ nyaya-legal-ai/
 | JSON validity | 67% | **98%** | 84% | 96% |
 | Hallucination rate | 31% | **4%** | 18% | 8% |
 | Cost per judgment | $0.00 | **$0.00** | $0.003 | $0.04 |
-"# nyaya-legal-ai" 

@@ -73,5 +73,6 @@ class SimilarCase(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
+    model_error: Optional[str] = None
     statute_index_size: int
     precedent_index_size: int

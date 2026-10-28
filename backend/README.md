@@ -9,8 +9,6 @@
 </p>
 
 <p align="center">
-  <a href="https://huggingface.co/your-username/nyaya-7b"><strong>🤗 Model</strong></a> ·
-  <a href="https://huggingface.co/spaces/your-username/nyaya-demo"><strong>🚀 Live Demo</strong></a> ·
   <a href="#benchmark-results"><strong>📊 Benchmark</strong></a> ·
   <a href="#quickstart"><strong>⚡ Quickstart</strong></a>
 </p>
@@ -51,20 +49,18 @@ Raw Judgment PDF / Text
 │  Agent 1            │  ← Nyaya-7B (finetuned Mistral-7B)
 │  Extraction         │    Extracts all fields → structured JSON
 └──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  Agent 2            │  ← RAG over IPC + CrPC + Constitution
-│  Statute Validation │    Catches hallucinated section numbers
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  Agent 3            │  ← Local ChromaDB + IndianKanoon API
-│  Precedent Resolver │    "AIR 1984 SC 1622" → full case name
-└──────────┬──────────┘
-           │
-           ▼
+           │  (unparseable output → straight to assembly with an error)
+           ├───────────────────────────────┐
+           ▼                               ▼
+┌─────────────────────┐         ┌─────────────────────┐
+│  Agent 2            │         │  Agent 3            │   run in parallel
+│  Statute Validation │         │  Precedent Resolver │
+│  section must appear│         │  local Chroma index │
+│  in the judgment;   │         │  "AIR 1984 SC 1622" │
+│  corpus text added  │         │  → full case name   │
+└──────────┬──────────┘         └──────────┬──────────┘
+           └───────────────┬───────────────┘
+                           ▼
 ┌─────────────────────┐
 │  Agent 4            │  ← Rule-based + RAG-grounded scoring
 │  Confidence Scorer  │    Per-field confidence, flags uncertainty
@@ -102,41 +98,43 @@ r=16 is the sweet spot — within 1 point of r=32 at 80% of the VRAM cost.
 
 ## Quickstart
 
+Runs fully locally on an NVIDIA GPU with 6 GB+ VRAM (Nyaya-7B is loaded in 4-bit, ~4.1 GB).
+The merged checkpoint is read from `kaggle/nyaya7b-finetuning-output/nyaya-checkpoints/nyaya-7b-merged`
+(override with `FINETUNED_MODEL_PATH` in `.env`); nothing is downloaded from the Hugging Face Hub.
+
 ```bash
-git clone https://github.com/your-username/nyaya-legal-ai
-cd nyaya-legal-ai
-cp .env.example .env   # fill in your API keys
-docker-compose up      # starts Redis + FastAPI + Celery + Gradio
+cd backend
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+
+run.bat                            # starts the API (new window) + UI using the .nyaya venv
 ```
 
-Visit `http://localhost:8000/docs` for the API, `http://localhost:7860` for the Gradio demo.
+To start them by hand, activate the venv first (`.nyaya\Scripts\activate`) — the plain
+`python` on PATH is Anaconda's base install, whose transformers/huggingface-hub versions
+don't match. Then run `python -m api.main` and `streamlit run streamlit_app.py` in two terminals.
 
-**Or use the model directly:**
+**Or run the pipeline from the command line:**
+
+```bash
+python -m agents.graph               # built-in sample judgment
+python -m agents.graph judgment.txt  # your own judgment
+```
+
+**Or call the model directly from Python:**
 
 ```python
-from transformers import pipeline
-import torch, json
+from agents.extraction_agent import generate_extraction, _extract_json
 
-pipe = pipeline(
-    "text-generation",
-    model="your-username/nyaya-7b",
-    torch_dtype=torch.float16,
-    device_map="auto",
-)
-
-judgment = """
-IN THE SUPREME COURT OF INDIA
-State of Punjab v. Gurpreet Singh
-Sections 302 and 34 IPC. Appeal allowed. Conviction restored.
-"""
-
-output = pipe(
-    f"[INST] Extract structured data from this judgment and return JSON:\n\n{judgment} [/INST]",
-    max_new_tokens=512, temperature=0.1, return_full_text=False,
-)[0]["generated_text"]
-
-print(json.loads(output))
+raw = generate_extraction(judgment_text)   # loads the local model on first call
+print(_extract_json(raw))
 ```
+
+The prompt must match training exactly (`<s>[INST] {system}
+
+{user} [/INST]`) — see
+`agents/extraction_agent.py`. The checkpoint was saved with transformers 5.x, so the loader
+also restores Mistral v0.3's `rope_theta=1e6`, which transformers 4.x would otherwise drop.
 
 ---
 
@@ -148,9 +146,10 @@ nyaya-legal-ai/
 │   ├── schema.py              # canonical JSON extraction schema
 │   ├── prepare_dataset.py     # data collection + Gemini 1.5 Flash labelling
 │   ├── train.py               # QLoRA training script (Kaggle T4 x2)
-│   ├── merge_and_push.py      # merge LoRA → push to HuggingFace Hub
+│   ├── merge_and_push.py      # merge LoRA adapter into the base model
 │   └── evaluate_model.py      # perplexity + JSON validity checks
 ├── agents/
+│   ├── config.py              # paths, offline mode, cached ChromaDB collections
 │   ├── state.py               # LangGraph shared state schema
 │   ├── extraction_agent.py    # Agent 1: Nyaya-7B extraction
 │   ├── rag_agent.py           # Agent 2: statute validation (ChromaDB)
@@ -167,11 +166,9 @@ nyaya-legal-ai/
 ├── scripts/
 │   ├── build_knowledge_base.py  # build ChromaDB statute + precedent indexes
 │   └── active_learning.py       # re-label uncertain predictions for v2
-├── demo/
-│   └── app.py                 # HuggingFace Spaces Gradio demo
-├── notebooks/
-│   └── kaggle_training.py     # self-contained Kaggle training notebook
-└── docker-compose.yml
+├── streamlit_app.py           # Streamlit UI (talks to the API)
+└── notebooks/
+    └── kaggle_training2.py    # self-contained Kaggle training notebook
 ```
 
 ---
@@ -258,10 +255,10 @@ Nyaya v2 (improved on its own failure modes)
 | Experiment tracking | Weights & Biases |
 | Agent orchestration | LangGraph |
 | Vector database | ChromaDB + BGE-base embeddings |
+| Inference | Local 4-bit (bitsandbytes NF4) on a single consumer GPU |
 | API backend | FastAPI + SSE streaming |
-| Task queue | Celery + Redis |
-| Demo | HuggingFace Spaces + Gradio |
-| Evaluation | Custom metrics + RAGAS |
+| UI | Streamlit |
+| Evaluation | Custom metrics |
 
 ---
 

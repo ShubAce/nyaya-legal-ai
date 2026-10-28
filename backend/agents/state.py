@@ -1,26 +1,29 @@
 """
 state.py — Shared state schema for the Nyaya LangGraph pipeline.
 
-Every agent reads from and writes to this state object.
-TypedDict enforces the contract between agents.
+Each agent returns only the keys it produces. `audit_trail` and `errors` use an
+`operator.add` reducer, so agents return just their new entries and LangGraph
+appends them — this is what lets the statute and precedent agents run in
+parallel without overwriting each other's updates.
 """
 
-from typing import Optional, TypedDict
+import operator
+from typing import Annotated, Optional, TypedDict
 
 
-class LegalExtractionState(TypedDict):
+class LegalExtractionState(TypedDict, total=False):
     # ── Input ─────────────────────────────────────────────────────────────────
     judgment_text: str
 
     # ── Agent 1: Extraction (Nyaya-7B) ────────────────────────────────────────
-    raw_extraction: Optional[dict]          # raw JSON from finetuned model
+    raw_extraction: Optional[dict]          # normalised JSON from the finetuned model
 
-    # ── Agent 2: Statute Validation (RAG) ─────────────────────────────────────
-    validated_statutes:    Optional[list]   # statutes confirmed in corpus
-    hallucinated_statutes: Optional[list]   # statutes NOT found in corpus
+    # ── Agent 2: Statute Validation ───────────────────────────────────────────
+    validated_statutes:    Optional[list]   # statutes found in the judgment text
+    hallucinated_statutes: Optional[list]   # statutes NOT found in the judgment text
 
     # ── Agent 3: Precedent Resolution ─────────────────────────────────────────
-    resolved_precedents: Optional[list]     # citations resolved to case names
+    resolved_precedents: Optional[list]     # citations, resolved to case names where possible
 
     # ── Agent 4: Confidence Scoring ───────────────────────────────────────────
     per_field_confidence: Optional[dict]    # {"case_name": 0.97, "statutes_cited": 0.81, ...}
@@ -28,8 +31,8 @@ class LegalExtractionState(TypedDict):
     overall_confidence:   Optional[float]   # mean confidence across all fields
 
     # ── Final output ──────────────────────────────────────────────────────────
-    final_output:  Optional[dict]           # fully enriched, validated extraction
-    audit_trail:   list                     # full per-agent reasoning trace
+    final_output: Optional[dict]                    # fully enriched, validated extraction
+    audit_trail:  Annotated[list, operator.add]     # per-agent reasoning trace
 
     # ── Error handling ────────────────────────────────────────────────────────
-    errors: Optional[list]                  # any non-fatal errors during processing
+    errors: Annotated[list, operator.add]           # non-fatal errors during processing

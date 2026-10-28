@@ -4,8 +4,8 @@ confidence_agent.py — Agent 4: Per-field confidence scoring and uncertainty fl
 This agent scores how confident the system is in each extracted field,
 using a combination of:
   - Rule-based checks (known valid values, format validation)
-  - RAG validation results (statute verification rate)
-  - Citation resolution rate
+  - Statute validation results (share of statutes grounded in the judgment)
+  - Precedent grounding (share of extracted citations present in the judgment)
   - Heuristic text length / completeness checks
 
 Fields below the threshold are flagged for human review.
@@ -14,6 +14,8 @@ This is how production legal AI systems work — they don't pretend to be
 """
 
 import re
+from datetime import date
+
 from loguru import logger
 from agents.state import LegalExtractionState
 
@@ -67,7 +69,7 @@ def _score_court(extraction: dict) -> float:
     court = extraction.get("court") or ""
     if not court:
         return 0.0
-    if court.lower().strip() in VALID_COURTS:
+    if court.lower().strip().removeprefix("the ") in VALID_COURTS:
         return 1.0
     # Partial match — contains "court"
     if "court" in court.lower():
@@ -81,7 +83,7 @@ def _score_year(extraction: dict, judgment_text: str) -> float:
         return 0.0
     try:
         y = int(year)
-        if 1950 <= y <= 2025:
+        if 1950 <= y <= date.today().year:
             # Cross-check: does the year appear in the judgment text?
             if str(y) in judgment_text:
                 return 1.0
@@ -136,28 +138,27 @@ def _score_statutes(validated: list, hallucinated: list) -> float:
     total = len(validated) + len(hallucinated)
     if total == 0:
         return 0.50  # No statutes — uncertain (might be legit for some cases)
-    verified_rate = len(validated) / total
-    # Penalise heavily if hallucination rate is high
-    if verified_rate < 0.5:
+    grounded_rate = sum(1 for s in validated if s.get("verified")) / total
+    # Penalise heavily if many statutes are not mentioned in the judgment
+    if grounded_rate < 0.5:
         return 0.30
-    return round(0.50 + verified_rate * 0.50, 3)  # scales 0.50 → 1.0
+    return round(0.50 + grounded_rate * 0.50, 3)  # scales 0.50 → 1.0
 
 
 def _score_precedents(resolved: list) -> float:
-    if not resolved:
+    # Only score what the model extracted; citations added by the text scan are grounded by definition.
+    from_model = [r for r in resolved if not r.get("from_text_scan")]
+    if not from_model:
         return 0.70  # No precedents cited — often fine
-    resolved_count = sum(1 for r in resolved if r.get("resolved", False))
-    resolution_rate = resolved_count / len(resolved)
-    if resolution_rate == 0:
-        return 0.40
-    return round(0.50 + resolution_rate * 0.50, 3)
+    grounded_rate = sum(1 for r in from_model if r.get("grounded")) / len(from_model)
+    if grounded_rate == 0:
+        return 0.30
+    return round(0.50 + grounded_rate * 0.50, 3)
 
 
 def _score_legal_issues(extraction: dict) -> float:
-    issues = extraction.get("legal_issues", [])
+    issues = extraction.get("legal_issues") or []
     if not issues:
-        return 0.40
-    if len(issues) == 0:
         return 0.40
     # Issues should be questions or substantial phrases
     avg_len = sum(len(i) for i in issues) / len(issues)
@@ -172,13 +173,13 @@ def _score_citation_format(extraction: dict) -> float:
     """Validate the top-level citation string format."""
     citation = extraction.get("citation") or ""
     if not citation:
-        return 0.50  # Citation often not mentioned explicitly — okay
+        return 0.70  # Many judgments carry no reported citation — neutral, not flagged
     if CITATION_REGEX.search(citation):
         return 1.0
     return 0.40
 
 
-def confidence_scoring_agent(state: LegalExtractionState) -> LegalExtractionState:
+def confidence_scoring_agent(state: LegalExtractionState) -> dict:
     """
     Agent 4: Score per-field confidence and flag uncertain fields.
 
@@ -188,9 +189,6 @@ def confidence_scoring_agent(state: LegalExtractionState) -> LegalExtractionStat
         - overall_confidence: mean of all field scores
         - audit_trail: appends scoring event
     """
-    audit  = state.get("audit_trail", [])
-    errors = state.get("errors", [])
-
     extraction   = state.get("raw_extraction", {}) or {}
     validated    = state.get("validated_statutes", []) or []
     hallucinated = state.get("hallucinated_statutes", []) or []
@@ -222,26 +220,22 @@ def confidence_scoring_agent(state: LegalExtractionState) -> LegalExtractionStat
         for field in uncertain:
             logger.warning(f"  {field}: {per_field[field]:.2f}")
 
-    audit.append({
-        "agent":             "confidence_scoring",
-        "status":            "complete",
-        "overall_confidence": overall,
-        "per_field":         per_field,
-        "uncertain_fields":  uncertain,
-        "flagged_count":     len(uncertain),
-        "threshold":         CONFIDENCE_THRESHOLD,
-    })
-
     logger.info(
         f"Confidence scoring: overall={overall:.2f}, "
         f"{len(uncertain)} fields flagged for review"
     )
 
     return {
-        **state,
         "per_field_confidence": per_field,
         "uncertain_fields":     uncertain,
         "overall_confidence":   overall,
-        "audit_trail":          audit,
-        "errors":               errors,
+        "audit_trail": [{
+            "agent":              "confidence_scoring",
+            "status":             "complete",
+            "overall_confidence": overall,
+            "per_field":          per_field,
+            "uncertain_fields":   uncertain,
+            "flagged_count":      len(uncertain),
+            "threshold":          CONFIDENCE_THRESHOLD,
+        }],
     }

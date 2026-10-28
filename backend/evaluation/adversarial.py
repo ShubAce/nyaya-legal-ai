@@ -172,7 +172,7 @@ def run_adversarial_tests(system_name: str = "nyaya") -> dict:
         pipeline = build_pipeline()
         def predict(text):
             result = run_pipeline(pipeline, text)
-            return result.get("final_output", {}), result
+            return result.get("final_output") or {}, result
     elif system_name == "gemini_pro":
         sys = GeminiProSystem()
         def predict(text):

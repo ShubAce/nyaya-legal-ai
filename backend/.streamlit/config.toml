@@ -1,0 +1,42 @@
+# Streamlit theme for the Nyaya UI. Streamlit reads this when launched from backend/ (run.bat does that).
+
+[server]
+address = "127.0.0.1"   # local only — don't expose the UI on the network
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap, sans-serif"
+headingFont = "Source Serif 4:https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@500;600;700&display=swap, Georgia, serif"
+codeFont = "JetBrains Mono:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap, monospace"
+headingFontWeights = 600
+baseRadius = "0.5rem"
+showWidgetBorder = true
+
+[theme.light]
+primaryColor = "#22407a"
+backgroundColor = "#f6f5f1"
+secondaryBackgroundColor = "#ecebe5"
+textColor = "#1b1b19"
+borderColor = "#dcdad2"
+linkColor = "#22407a"
+
+[theme.light.sidebar]
+backgroundColor = "#efeee8"
+secondaryBackgroundColor = "#e5e4dd"
+
+[theme.dark]
+primaryColor = "#3f73d6"
+backgroundColor = "#121211"
+secondaryBackgroundColor = "#1f1f1d"
+textColor = "#f2f1ec"
+borderColor = "#31312e"
+linkColor = "#8fb3ef"
+
+[theme.dark.sidebar]
+backgroundColor = "#171716"
+secondaryBackgroundColor = "#222220"

@@ -1,210 +1,155 @@
 """
-rag_agent.py — Agent 2: Validates extracted statutes against the ChromaDB
-statute corpus (IPC, CrPC, Constitution, etc.).
+rag_agent.py — Agent 2: Validates extracted statutes.
 
-This agent catches hallucinated statute sections — the most common failure
-mode of base LLMs on Indian legal text. If the model invents "Section 498-ZZ
-of the IPC", this agent will catch it because no matching section exists in
-the corpus.
+A statute is a hallucination when the judgment never mentions it, so each
+extracted section is first checked against the judgment text itself. Sections
+that are grounded are then looked up in the ChromaDB statute corpus (exact
+"Section N." / "Article N." match) to attach the actual statutory text.
+
+Semantic similarity is not used for verification: embeddings cannot tell
+"Section 302" from "Section 307", so a nearest-neighbour distance says nothing
+about whether a section number is real.
 """
 
-import os
+import re
 import time
-from functools import lru_cache
-from pathlib import Path
+from typing import Optional
 
-import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from loguru import logger
-from dotenv import load_dotenv
 
+from agents.config import get_collection
 from agents.state import LegalExtractionState
 
-load_dotenv()
+# (pattern, canonical act name, act key in the statute corpus or None).
+# The corpus key is None where data/statute_corpus holds the wrong document:
+# crpc.txt is the 1980 amendment act, evidence_act.txt is the Bankers' Books
+# Evidence Act and limitation_act.txt is the Delimitation Act.
+ACTS = [
+    (r"penal code|\bi\.?\s?p\.?\s?c\b",                    "Indian Penal Code",          "Ipc"),
+    (r"criminal procedure|\bcr\.?\s?p\.?\s?c\b",           "Code of Criminal Procedure", None),
+    (r"civil procedure|\bc\.?\s?p\.?\s?c\b",               "Code of Civil Procedure",    "Cpc"),
+    (r"constitution",                                      "Constitution of India",      "Constitution"),
+    (r"negotiable instruments?|\bn\.?\s?i\.?\s?act\b",     "Negotiable Instruments Act", "Negotiable Instruments Act"),
+    (r"contract act",                                      "Indian Contract Act",        "Contract Act"),
+    (r"\bevidence act\b",                                  "Indian Evidence Act",        None),
+]
 
-CHROMA_STATUTE_PATH = Path(os.getenv("CHROMA_STATUTE_PATH", "data/chroma_statutes"))
-EMBED_MODEL         = "BAAI/bge-base-en-v1.5"
-
-# Distance threshold — below this = match found, above = hallucination
-HALLUCINATION_THRESHOLD = 0.38
-
-
-@lru_cache(maxsize=1)
-def _load_statute_collection():
-    """Load ChromaDB statute collection once and cache."""
-    logger.info(f"Loading statute ChromaDB from: {CHROMA_STATUTE_PATH}")
-    ef = SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
-    client = chromadb.PersistentClient(path=str(CHROMA_STATUTE_PATH))
-    collection = client.get_collection("statutes", embedding_function=ef)
-    logger.success(f"Statute collection loaded: {collection.count()} chunks")
-    return collection
+_SECTION_TOKEN = re.compile(r"\b\d{1,4}[A-Z]{0,3}\b", re.IGNORECASE)
 
 
-def get_standard_act_name(act_name: str) -> str:
-    act_lower = act_name.lower()
-    if "penal" in act_lower or "ipc" in act_lower:
-        return "Ipc"
-    if "constitution" in act_lower:
-        return "Constitution"
-    if "criminal procedure" in act_lower or "crpc" in act_lower or "cr.p.c" in act_lower:
-        return "Crpc"
-    if "evidence" in act_lower or "iea" in act_lower:
-        return "Evidence Act"
-    if "civil procedure" in act_lower or "cpc" in act_lower or "c.p.c" in act_lower:
-        return "Cpc"
-    if "contract" in act_lower:
-        return "Contract Act"
-    if "limitation" in act_lower:
-        return "Limitation Act"
-    if "negotiable" in act_lower:
-        return "Negotiable Instruments Act"
-    return act_name.title()
+def canonical_act(act: str) -> tuple[str, Optional[str]]:
+    """Return (display name, corpus key) for an act name as written by the model."""
+    lowered = act.lower()
+    for pattern, name, corpus_key in ACTS:
+        if re.search(pattern, lowered):
+            return name, corpus_key
+    return act.strip(), None
 
 
-def _validate_statute(collection, act: str, section: str) -> dict:
-    """
-    Query the statute corpus for a specific act + section.
-    Returns a result dict with verified flag and matched text.
-    """
-    query = f"{act} Section {section}"
+def split_sections(raw: str) -> list[str]:
+    """'302/34', 'Sections 302 and 34', '498-A', '21(1)(a)' -> ['302', '34'], ['498A'], ['21']."""
+    text = re.sub(r"\([^)]*\)", " ", raw)                  # drop sub-clauses like (1)(a)
+    text = re.sub(r"(\d)\s*-\s*([A-Z])\b", r"\1\2", text, flags=re.IGNORECASE)
+    return [s.upper() for s in _SECTION_TOKEN.findall(text)]
+
+
+def normalize_text(text: str) -> str:
+    """Lower-case, collapse whitespace (PDF line breaks) and join '498-A' into '498a'."""
+    text = re.sub(r"\s+", " ", text.lower())
+    return re.sub(r"(\d)\s*-\s*([a-z])\b", r"\1\2", text)
+
+
+def mentioned_in_text(section: str, text: str, is_article: bool) -> bool:
+    """True if the (normalised) judgment mentions this section/article number in a statutory context."""
+    num = re.escape(section.lower())
+    keyword = r"(?:articles?|art\.)" if is_article else r"(?:sections?|secs?\.?|ss?\.|u/ss?\.?|under|read with|r/w)"
+    before = rf"{keyword}.{{0,80}}?(?<![\w.]){num}(?![\w])"
+    after  = rf"(?<![\w.]){num}(?![\w]).{{0,25}}?(?:ipc|i\.p\.c|cr\.?p\.?c|c\.p\.c|cpc|of the|constitution|act)"
+    return re.search(before, text) is not None or re.search(after, text) is not None
+
+
+def lookup_corpus(collection, corpus_key: str, section: str) -> Optional[str]:
+    """Exact lookup of a section's text in the statute corpus."""
+    header = f"{'Article' if corpus_key == 'Constitution' else 'Section'} {section}."
     try:
-        standard_act = get_standard_act_name(act)
-        known_acts = {
-            "Ipc", "Constitution", "Crpc", "Evidence Act", "Cpc",
-            "Contract Act", "Limitation Act", "Negotiable Instruments Act"
-        }
-        
-        where_clause = None
-        if standard_act in known_acts:
-            where_clause = {"act": standard_act}
-
-        results = collection.query(
-            query_texts=[query],
-            n_results=3,
-            where=where_clause,
-            include=["documents", "metadatas", "distances"],
+        result = collection.get(
+            where={"act": corpus_key},
+            where_document={"$contains": header},
+            include=["documents"],
+            limit=10,
         )
+    except Exception as e:
+        logger.warning(f"Statute corpus lookup failed for {corpus_key} {header}: {e}")
+        return None
+    for doc in result.get("documents") or []:
+        # Only accept chunks where the section heading starts a line, not cross-references.
+        if re.search(rf"(^|\n)\s*{re.escape(header)}", doc):
+            return doc[:400]
+    return None
 
-        if not results["documents"] or not results["documents"][0]:
-            return {
-                "verified":    False,
-                "distance":    1.0,
-                "reason":      "no_results_returned",
-                "matched_text": None,
-            }
 
-        best_distance = results["distances"][0][0]
-        best_doc      = results["documents"][0][0]
-        best_meta     = results["metadatas"][0][0]
+def rag_validation_agent(state: LegalExtractionState) -> dict:
+    """
+    Agent 2: Validate each statute in raw_extraction.
 
-        verified = best_distance < HALLUCINATION_THRESHOLD
-
+    Every statute gets a `status`:
+        verified          — mentioned in the judgment and found in the statute corpus
+        grounded          — mentioned in the judgment; the corpus does not cover it
+        incomplete        — the model gave no section number, so it cannot be checked
+        not_in_judgment   — the judgment never mentions it (hallucination)
+    """
+    extraction = state.get("raw_extraction") or {}
+    statutes_claimed = extraction.get("statutes_cited") or []
+    if not statutes_claimed:
         return {
-            "verified":    verified,
-            "distance":    round(best_distance, 4),
-            "matched_act": best_meta.get("act", ""),
-            "matched_sec": best_meta.get("section", ""),
-            "matched_text": best_doc[:300] if verified else None,
-            "reason":      "match_found" if verified else "no_close_match",
+            "validated_statutes": [], "hallucinated_statutes": [],
+            "audit_trail": [{"agent": "statute_validation", "status": "no_statutes_to_validate"}],
         }
 
-    except Exception as e:
-        logger.warning(f"Statute validation query failed for '{query}': {e}")
-        return {"verified": False, "distance": 1.0, "reason": f"query_error: {e}", "matched_text": None}
-
-
-def rag_validation_agent(state: LegalExtractionState) -> LegalExtractionState:
-    """
-    Agent 2: Validate each statute in raw_extraction against the ChromaDB corpus.
-
-    Writes to state:
-        - validated_statutes: list of statutes confirmed in corpus
-        - hallucinated_statutes: list of statutes NOT found in corpus
-        - audit_trail: appends validation event
-    """
-    audit  = state.get("audit_trail", [])
-    errors = state.get("errors", [])
-
-    extraction = state.get("raw_extraction")
-    if not extraction:
-        audit.append({"agent": "statute_validation", "status": "skipped", "reason": "no_extraction"})
-        return {**state, "validated_statutes": [], "hallucinated_statutes": [], "audit_trail": audit}
-
-    statutes_claimed = extraction.get("statutes_cited", [])
-    if not statutes_claimed:
-        audit.append({
-            "agent":  "statute_validation",
-            "status": "no_statutes_to_validate",
-        })
-        return {**state, "validated_statutes": [], "hallucinated_statutes": [], "audit_trail": audit}
-
-    try:
-        collection = _load_statute_collection()
-    except Exception as e:
-        error_msg = f"rag_agent: could not load statute collection: {e}"
-        logger.warning(error_msg)
-        errors.append(error_msg)
-        # Graceful degradation — mark all as unverified rather than crashing
-        unverified = [{**s, "verified": False, "reason": "collection_unavailable"} for s in statutes_claimed]
-        audit.append({"agent": "statute_validation", "status": "collection_unavailable", "error": str(e)})
-        return {**state, "validated_statutes": [], "hallucinated_statutes": unverified,
-                "audit_trail": audit, "errors": errors}
-
+    judgment_text = normalize_text(state.get("judgment_text") or "")
+    collection = get_collection("statutes")
     validated, hallucinated = [], []
     t0 = time.time()
 
     for statute in statutes_claimed:
-        act     = statute.get("act", "")
-        section = statute.get("section", "")
-
-        if not act or not section:
-            # Can't validate without act + section
-            hallucinated.append({**statute, "verified": False, "reason": "missing_act_or_section"})
+        act_name, corpus_key = canonical_act(statute.get("act") or "")
+        sections = split_sections(statute.get("section") or "")
+        if not sections:
+            validated.append({**statute, "act": act_name, "verified": False, "status": "incomplete"})
             continue
 
-        result = _validate_statute(collection, act, section)
+        is_article = act_name == "Constitution of India"
+        for section in sections:
+            entry = {**statute, "act": act_name, "section": section}
+            if not mentioned_in_text(section, judgment_text, is_article):
+                hallucinated.append({**entry, "verified": False, "status": "not_in_judgment"})
+                logger.warning(f"Possible hallucination: {act_name} §{section} is not mentioned in the judgment")
+                continue
 
-        enriched = {
-            **statute,
-            "verified":    result["verified"],
-            "distance":    result.get("distance"),
-            "matched_act": result.get("matched_act"),
-            "matched_sec": result.get("matched_sec"),
-            "actual_text": result.get("matched_text"),
-            "reason":      result.get("reason"),
-        }
+            actual_text = lookup_corpus(collection, corpus_key, section) if collection and corpus_key else None
+            validated.append({
+                **entry,
+                "verified":    True,
+                "status":      "verified" if actual_text else "grounded",
+                "actual_text": actual_text,
+            })
 
-        if result["verified"]:
-            validated.append(enriched)
-        else:
-            hallucinated.append(enriched)
-            logger.warning(
-                f"Potential hallucination: {act} §{section} "
-                f"(distance={result.get('distance', '?'):.3f})"
-            )
-
-    elapsed = time.time() - t0
-    total   = len(statutes_claimed)
-
-    audit.append({
-        "agent":              "statute_validation",
-        "status":             "complete",
-        "total_statutes":     total,
-        "verified_count":     len(validated),
-        "hallucinated_count": len(hallucinated),
-        "hallucination_rate": round(len(hallucinated) / total, 3) if total else 0.0,
-        "latency":            round(elapsed, 2),
-    })
-
-    logger.info(
-        f"Statute validation: {len(validated)}/{total} verified, "
-        f"{len(hallucinated)} flagged as potential hallucinations ({elapsed:.1f}s)"
-    )
+    total = len(validated) + len(hallucinated)
+    elapsed = round(time.time() - t0, 2)
+    logger.info(f"Statute validation: {len(validated)}/{total} grounded, {len(hallucinated)} flagged ({elapsed:.1f}s)")
 
     return {
-        **state,
         "validated_statutes":    validated,
         "hallucinated_statutes": hallucinated,
-        "audit_trail":           audit,
-        "errors":                errors,
+        "audit_trail": [{
+            "agent":              "statute_validation",
+            "status":             "complete",
+            "total_statutes":     total,
+            "in_corpus_count":    sum(1 for s in validated if s["status"] == "verified"),
+            "grounded_count":     sum(1 for s in validated if s["verified"]),
+            "hallucinated_count": len(hallucinated),
+            "hallucination_rate": round(len(hallucinated) / total, 3) if total else 0.0,
+            "corpus_available":   collection is not None,
+            "latency":            elapsed,
+        }],
     }
